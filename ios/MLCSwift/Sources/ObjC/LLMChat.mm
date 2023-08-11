@@ -169,9 +169,17 @@ enum PlaceInPrompt : int {
 }
 
 - (void)evaluate {
-  LOG(INFO) << "Total-mem-budget=" << os_proc_available_memory() / (1 << 20) << "MB";
+    if (@available(iOS 13.0, *)) {
+        LOG(INFO) << "Total-mem-budget=" << os_proc_available_memory() / (1 << 20) << "MB";
+    } else {
+        // Fallback on earlier versions
+    }
   llm_chat_->GetFunction("evaluate")();
-  LOG(INFO) << "Left-mem-budget=" << os_proc_available_memory() / (1 << 20) << "MB";
+    if (@available(iOS 13.0, *)) {
+        LOG(INFO) << "Left-mem-budget=" << os_proc_available_memory() / (1 << 20) << "MB";
+    } else {
+        // Fallback on earlier versions
+    }
 }
 
 - (void)unloadImageModule {
