@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 import shutil
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import tvm
 from tvm import relax
@@ -65,10 +65,14 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
         "rwkv-": "rwkv",
         "gorilla-": "gorilla",
         "guanaco": "guanaco",
-        "starcoder": "code_gpt",
-        "wizardcoder-": "code_gpt",
-        "wizardlm-": "wizardlm",
-        "gpt_bigcode-santacoder": "code_gpt",
+        "wizardlm-7b": "wizardlm_7b",  # first get rid of 7b
+        "wizardlm-": "vicuna_v1.1",  # all others use vicuna template
+        "wizardmath-": "wizard_coder_or_math",
+        "wizardcoder-": "wizard_coder_or_math",
+        "starcoder": "gpt_bigcode",
+        "gpt_bigcode-santacoder": "gpt_bigcode",
+        "stablecode-completion": "stablecode_completion",
+        "stablecode-instruct": "stablecode_instruct",
         "chatglm2": "glm",
         "codegeex2": "glm",
     }
@@ -94,6 +98,53 @@ def debug_dump_script(mod, name, args: argparse.Namespace, show_meta=True):
         outfile.write(mod.script(show_meta=show_meta))
     print(f"Dump mod to {dump_path}")
 
+
+def debug_dump_benchmark_script(
+    mod: tvm.ir.IRModule,
+    name: str,
+    args: argparse.Namespace,
+) -> None:
+    """Extract model level benchmark workloads from relax model."""
+    from tvm.dlight.benchmark import extract_all_func_info_from_relax
+
+    if not args.debug_dump:
+        return
+    # pylint: disable=import-error,import-outside-toplevel
+    dump_path = os.path.join(args.artifact_path, "debug", name + ".py")
+    with open(dump_path, "w", encoding="utf-8") as outfile:
+        outfile.write(
+            "# Please save this file to dlight_bench/models and add\n"
+            + f"# `from .{name} import *` to dlight_bench/models/__init__.py\n"
+            + "from dlight_bench import DlightBench\n"
+            + "from tvm.script import tir as T\n\n"
+        )
+
+        stmt = []
+        try:
+            relax_funcs, _ = extract_all_func_info_from_relax(mod)
+        except NotImplementedError:
+            return
+        tvm_script_prefix = "# from tvm.script import tir as T"
+        for relax_func_gv in relax_funcs:  # pylint: disable=consider-using-dict-items
+            for prim_func_gv in relax_funcs[relax_func_gv]:
+                # add global_symbol
+                func_body = (
+                    mod[prim_func_gv]
+                    .with_attr("global_symbol", prim_func_gv.name_hint)
+                    .script(name=prim_func_gv.name_hint)
+                )
+                # remove prefix
+                if func_body.startswith(tvm_script_prefix + "\n"):
+                    func_body = func_body[len(tvm_script_prefix) :]
+                # print out
+                outfile.write(func_body + "\n")
+                # register
+                stmt.append(
+                    f"DlightBench.register_bench_workload({prim_func_gv.name_hint}, "
+                    f"'{name}', '{prim_func_gv.name_hint}')"
+                )
+        outfile.write("\n" + "\n".join(stmt) + "\n")
+    print(f"Dump benchmarking script to {dump_path}.")
 
 def debug_load_script(name: str, args: argparse.Namespace):
     input_path = os.path.join(args.artifact_path, "debug", name)
