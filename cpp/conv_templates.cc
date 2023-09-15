@@ -54,6 +54,40 @@ Conversation Llama2() {
   return conv;
 }
 
+Conversation CodeLlamaCompletion() {
+  Conversation conv;
+  conv.name = "codellama_completion";
+  conv.system = "";
+  conv.roles = {"Prompt", "Code"};
+  conv.messages = {};
+  conv.offset = 0;
+  conv.separator_style = SeparatorStyle::kCodeCompletion;
+  conv.seps = {""};
+  conv.role_msg_sep = "";
+  conv.role_empty_sep = "";
+  conv.stop_tokens = {2};
+  conv.stop_str = "</s>";
+  conv.add_bos = true;
+  return conv;
+}
+
+Conversation CodeLlamaInstruct() {
+  Conversation conv;
+  conv.name = "codellama_instruct";
+  conv.system = "";
+  conv.roles = {"[INST]", "[/INST]"};
+  conv.messages = {};
+  conv.offset = 0;
+  conv.separator_style = SeparatorStyle::kSepRoleMsg;
+  conv.seps = {" "};
+  conv.role_msg_sep = " ";
+  conv.role_empty_sep = " ";
+  conv.stop_tokens = {2};
+  conv.stop_str = "</s>";
+  conv.add_bos = true;
+  return conv;
+}
+
 Conversation VicunaV11() {
   Conversation conv;
   conv.name = "vicuna_v1.1";
@@ -170,6 +204,31 @@ Conversation RWKV() {
        "confident with my expertise. So please go ahead!"}};
   conv.separator_style = SeparatorStyle::kSepRoleMsg;
   conv.offset = 8;
+  conv.seps = {"\n\n"};
+  conv.role_msg_sep = ": ";
+  conv.role_empty_sep = ":";
+  conv.stop_str = "\n\n";
+  // TODO(mlc-team): add eos to mlc-chat-config
+  // and remove eos from stop token setting.
+  conv.stop_tokens = {0};
+  conv.add_bos = false;
+  return conv;
+}
+
+Conversation RWKVWorld() {
+  const std::string kUserPrefix = "User: ";
+  const std::string kAssistantPrefix = "Assistant: Hi. I am your assistant and I will provide expert "
+                                       "full response in full details. Please feel free to ask any question and I will always answer it.";
+  const std::string kDoubleNewLine = "\n\n";
+  const std::string prompt =
+        "(" + kUserPrefix + "hi" + kDoubleNewLine + kAssistantPrefix + kDoubleNewLine + ")";
+  Conversation conv;
+  conv.name = "rwkv-world";
+  conv.system = prompt;
+  conv.roles = {"User", "Assistant"};
+  conv.messages = {};
+  conv.separator_style = SeparatorStyle::kSepRoleMsg;
+  conv.offset = 0;
   conv.seps = {"\n\n"};
   conv.role_msg_sep = ": ";
   conv.role_empty_sep = ":";
@@ -493,9 +552,12 @@ Conversation Conversation::FromTemplate(const std::string& name) {
   static std::unordered_map<std::string, ConvFactory> factory = {
       {"llama_default", LlamaDefault},
       {"llama-2", Llama2},
+      {"codellama_completion", CodeLlamaCompletion},
+      {"codellama_instruct", CodeLlamaInstruct},
       {"vicuna_v1.1", VicunaV11},
       {"conv_one_shot", ConvOneShot},
       {"redpajama_chat", RedPajamaChat},
+      {"rwkv_world", RWKVWorld},
       {"rwkv", RWKV},
       {"gorilla", Gorilla},
       {"guanaco", Guanaco},

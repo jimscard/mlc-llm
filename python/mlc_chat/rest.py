@@ -5,7 +5,6 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 
-import tvm
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
@@ -14,9 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dataclasses import dataclass, field, fields
 from typing import Optional
 
+from .base import set_global_random_seed
 from .chat_module import ChatModule
 from .interface.openai_api import *
 
+import numpy as np
 
 @dataclass
 class RestAPIArgs:
@@ -79,6 +80,18 @@ class RestAPIArgs:
             )
         }
     )
+    random_seed: int = field(
+        default=None,
+        metadata={
+            "help": (
+                """
+                The random seed to initialize all the RNG used in mlc-chat. By default,
+                no seed is set.
+                """
+            )
+        }
+    )
+
 
 def convert_args_to_argparser() -> argparse.ArgumentParser:
     """Convert from RestAPIArgs to an equivalent ArgumentParser."""
@@ -98,8 +111,11 @@ def convert_args_to_argparser() -> argparse.ArgumentParser:
 
 session = {}
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if ARGS.random_seed is not None:
+        set_global_random_seed(ARGS.random_seed)
     chat_mod = ChatModule(
         model=ARGS.model,
         device=ARGS.device,
@@ -229,7 +245,30 @@ async def request_embeddings(request: EmbeddingsRequest):
     """
     Gets embedding for some text.
     """
-    assert "Endpoint not implemented."
+    inps = []
+    if type(request.input) == str:
+        inps.append(request.input)
+    elif type(request.input) == list:
+        inps = request.input
+    else:
+        assert f"Invalid input type {type(request.input)}"
+    
+    data = []
+    for i, inp in enumerate(inps):
+        session["chat_mod"].reset_chat()
+        emb = session["chat_mod"].embed_text(input=inp).numpy()
+        mean_emb = np.squeeze(np.mean(emb, axis=1), axis=0)
+        norm_emb = mean_emb / np.linalg.norm(mean_emb)
+        data.append({"object": "embedding", "embedding": norm_emb.tolist(), "index": i})
+    # TODO: Fill in correct usage info
+    return EmbeddingsResponse(
+        data=data,
+        usage=UsageInfo(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0
+        )
+    )
 
 
 @app.post("/chat/reset")

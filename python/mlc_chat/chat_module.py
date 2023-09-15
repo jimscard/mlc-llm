@@ -2,6 +2,7 @@
 #! pylint: disable=unused-import, invalid-name
 import inspect
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass, fields, asdict
@@ -16,25 +17,6 @@ from . import callback
 # pylint: disable=line-too-long
 _PYTHON_GET_STARTED_TUTORIAL_URL = "https://github.com/mlc-ai/notebooks/blob/main/mlc-llm/tutorial_chat_module_getting_started.ipynb"
 # pylint: enable=line-too-long
-
-
-def quantization_keys():
-    r"""Get the keys of all quantization schemes."""
-    return [
-        "autogptq_llama_q4f16_0",
-        "q0f16",
-        "q0f32",
-        "q3f16_0",
-        "q3f16_1",
-        "q4f16_0",
-        "q4f16_1",
-        "q4f16_2",
-        "q4f16_ft",
-        "q4f32_0",
-        "q4f32_1",
-        "q8f16_0",
-        "q8f16_ft",
-    ]
 
 
 @dataclass
@@ -97,6 +79,7 @@ class ConvConfig:
     def __post_init__(self):
         if self.messages is not None and self.offset is None:
             self.offset = len(self.messages)
+
 
 @dataclass
 class ChatConfig:
@@ -177,10 +160,13 @@ class ChatConfig:
 
     @classmethod
     def _from_json(chat_config_cls, json_obj: dict):
-        return chat_config_cls(**{
-            k: v for k, v in json_obj.items()
-            if k in inspect.signature(chat_config_cls).parameters
-        })
+        return chat_config_cls(
+            **{
+                k: v
+                for k, v in json_obj.items()
+                if k in inspect.signature(chat_config_cls).parameters
+            }
+        )
 
 
 class PlaceInPrompt(Enum):
@@ -233,8 +219,8 @@ def _get_model_path(model: str) -> (str, str):
     for candidate in candidate_paths:
         chat_file = os.path.join(candidate, "mlc-chat-config.json")
         if os.path.isfile(chat_file):
-            print(f"Using model folder: {os.path.abspath(candidate)}")
-            print(f"Using mlc chat config: {os.path.abspath(chat_file)}")
+            logging.info(f"Using model folder: {os.path.abspath(candidate)}")
+            logging.info(f"Using mlc chat config: {os.path.abspath(chat_file)}")
             return candidate, chat_file
 
     # Failed to find a valid model_path, analyzing error for user
@@ -305,14 +291,14 @@ def _get_chat_config(config_file_path: str, user_chat_config: Optional[ChatConfi
     return final_chat_config
 
 
-def _get_lib_module(
+def _get_lib_module_path(
     model: str,
     model_path: str,
     chat_config: ChatConfig,
     lib_path: Optional[str],
     device_name: str,
     config_file_path: str,
-) -> tvm.runtime.Module:
+) -> str:
     """Look up the model library. Then return a corresponding ``tvm`` runtime Module.
 
     Parameters
@@ -332,8 +318,8 @@ def _get_lib_module(
 
     Returns
     ------
-    lib_module : tvm.runtime.Module
-        A tvm runtime module corresponding to the model library we find.
+    lib_path : str
+        The path pointing to the model library we find.
 
     Raises
     ------
@@ -342,8 +328,8 @@ def _get_lib_module(
     # 1. Use user's lib_path if provided
     if lib_path is not None:
         if os.path.isfile(lib_path):
-            print(f"Using library model: {lib_path}")
-            return tvm.runtime.load_module(lib_path)
+            logging.info(f"Using library model: {lib_path}")
+            return lib_path
         else:
             err_msg = (
                 f"The `lib_path` you passed in is not a file: {lib_path}.\nPlease checkout "
@@ -388,8 +374,8 @@ def _get_lib_module(
     # 4. Search for model library
     for candidate in candidate_paths:
         if os.path.isfile(candidate):
-            print(f"Using library model: {os.path.abspath(candidate)}\n")
-            return tvm.runtime.load_module(candidate)
+            logging.info(f"Using library model: {os.path.abspath(candidate)}\n")
+            return candidate
 
     # 5. Error
     err_msg = (
@@ -473,7 +459,7 @@ def _detect_local_device(device_id: int = 0):
     if tvm.opencl().exist:
         return tvm.opencl(device_id), "opencl"
 
-    print(
+    logging.info(
         "None of the following device is detected: metal, rocm, cuda, vulkan, opencl. Switch to llvm instead."
     )
     return tvm.cpu(device_id), "llvm"
@@ -543,7 +529,7 @@ class ChatModule:
     ):
         device_err_msg = (
             f"Invalid device name: {device}. Please enter the device in the form "
-            "'device_name:device_id' or 'device_name', where 'device_name' need to be "
+            "'device_name:device_id' or 'device_name', where 'device_name' needs to be "
             "one of 'cuda', 'metal', 'vulkan', 'rocm', 'opencl', 'auto'."
         )
 
@@ -569,7 +555,7 @@ class ChatModule:
             self.device = tvm.opencl(device_id)
         elif device_name == "auto":
             self.device, device_name = _detect_local_device(device_id)
-            print(f"System automatically detected device: {device_name}")
+            logging.info(f"System automatically detected device: {device_name}")
         else:
             raise ValueError(device_err_msg)
         device_type = self.device.device_type
@@ -606,7 +592,7 @@ class ChatModule:
         self.chat_config = _get_chat_config(self.config_file_path, chat_config)
 
         # 5. Look up model library
-        self.lib_path = _get_lib_module(
+        self.lib_path = _get_lib_module_path(
             model, self.model_path, self.chat_config, lib_path, device_name, self.config_file_path
         )
 

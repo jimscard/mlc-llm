@@ -1,4 +1,4 @@
-# pylint: disable=missing-docstring, redefined-outer-name
+# pylint: disable=missing-docstring, redefined-outer-name, not-callable
 import argparse
 import json
 import os
@@ -6,11 +6,18 @@ import pickle
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
-import mlc_llm
 import tvm
+import tvm.relax.backend.contrib.cublas as _
+from tvm import dlight as dl
+from tvm import relax
+from tvm.contrib.nvcc import parse_compute_version
+from tvm.relax.backend import get_patterns_with_prefix
+from tvm.relax.backend.contrib.cutlass import annotate_workspace
+
+import mlc_llm
 from mlc_llm import utils
-from mlc_llm.transform import rewrite_attention, fuse_split_rotary_embedding
 from mlc_llm.relax_model import (
+    chatglm,
     gpt_bigcode,
     gpt_neox,
     gptj,
@@ -18,15 +25,8 @@ from mlc_llm.relax_model import (
     minigpt,
     param_manager,
     rwkv,
-    chatglm,
 )
-
-from tvm import dlight as dl
-from tvm import relax
-from tvm.contrib.nvcc import parse_compute_version
-from tvm.relax.backend import get_patterns_with_prefix
-from tvm.relax.backend.contrib.cutlass import annotate_workspace
-import tvm.relax.backend.contrib.cublas as _
+from mlc_llm.transform import fuse_split_rotary_embedding, rewrite_attention
 
 
 @dataclass
@@ -147,6 +147,12 @@ class BuildArgs:
         default="",
         metadata={"help": "/path/to/llvm-mingw-root, use llvm-mingw to cross compile to windows."},
     )
+    cc_path: str = field(
+        default="",
+        metadata={
+            "help": "/path/to/cross_compiler_path, Currently only used for cross-compile for nvidia/jetson device."
+        },
+    )
     system_lib: bool = field(
         default=False,
         metadata={"help": "A parameter to `relax.build`.", "action": "store_true"},
@@ -195,9 +201,11 @@ class BuildArgs:
     no_cublas: bool = field(
         default=False,
         metadata={
-            "help": ("Disable the step that offloads matmul to cuBLAS. Without this flag, "
-                     "matmul will be offloaded to cuBLAS if quantization mode is q0f16 or q0f32, "
-                     "target is CUDA and TVM has been built with cuBLAS enbaled."),
+            "help": (
+                "Disable the step that offloads matmul to cuBLAS. Without this flag, "
+                "matmul will be offloaded to cuBLAS if quantization mode is q0f16 or q0f32, "
+                "target is CUDA and TVM has been built with cuBLAS enbaled."
+            ),
             "action": "store_true",
         },
     )
@@ -209,6 +217,15 @@ class BuildArgs:
                 "projection between two attention layers are put into a graph."
             ),
             "action": "store_true",
+        },
+    )
+    num_shards: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of shards to split the model into in tensor parallelism multi-gpu "
+                "inference"
+            ),
         },
     )
 
@@ -347,21 +364,29 @@ def mod_transform_before_build(
         ]
         if args.sep_embed:
             model_names = ["embed", "prefill_with_embed"] + model_names[1:]
-        if args.model.startswith("rwkv-"):
+        if args.model.lower().startswith("rwkv-"):
             model_names += ["reset_kv_cache"]
 
     mod = param_manager.transform_dequantize(mod)
 
     use_ft_quant = args.quantization.name in ["q4f16_ft", "q8f16_ft"]
-    mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(
-        mod
-    )  # pylint: disable=not-callable
+    mod = mlc_llm.transform.FuseDecodeTranspose(skip_gemm=not use_ft_quant)(mod)
 
-    if "num_attention_heads" in config and "hidden_size" in config:
-        if args.max_seq_len:
-            mod = fuse_split_rotary_embedding(mod, config["num_attention_heads"], config["hidden_size"], args.max_seq_len)
-        else:
-            mod = fuse_split_rotary_embedding(mod, config["num_attention_heads"], config["hidden_size"])
+    if (
+        hasattr(config, "num_attention_heads")
+        and hasattr(config, "hidden_size")
+        and hasattr(config, "position_embedding_base")
+    ):
+        max_seq_len = None
+        if args.max_seq_len > 0:
+            max_seq_len = args.max_seq_len
+        elif hasattr(config, "max_sequence_length"):
+            max_seq_len = config.max_sequence_length
+
+        if max_seq_len:
+            mod = fuse_split_rotary_embedding(
+                mod, config.num_attention_heads, config.hidden_size, config.position_embedding_base
+            )
 
     if args.target_kind == "cuda":
         patterns = []
@@ -409,11 +434,9 @@ def mod_transform_before_build(
                 ]
             )(mod)
 
-    mod = mlc_llm.transform.FuseTransposeMatmul()(mod)  # pylint: disable=not-callable
+    mod = mlc_llm.transform.FuseTransposeMatmul()(mod)
     mod = relax.pipeline.get_pipeline()(mod)  # pylint: disable=no-value-for-parameter
-    mod = mlc_llm.transform.FuseDecodeMatmulEwise(  # pylint: disable=not-callable
-        args.quantization.name, args.target_kind
-    )(mod)
+    mod = mlc_llm.transform.FuseDecodeMatmulEwise()(mod)
     mod = mlc_llm.transform.FuseDecodeTake()(mod)
     mod = relax.transform.DeadCodeElimination(model_names)(mod)
     mod = mlc_llm.transform.CleanUpTIRAttrs()(mod)
@@ -426,6 +449,8 @@ def mod_transform_before_build(
 
 def dump_mlc_chat_config(
     args: argparse.Namespace,
+    vocab_size: int,
+    max_window_size: int,
     temperature: float = 0.7,
     repetition_penalty: float = 1.0,
     top_p: float = 0.95,
@@ -450,10 +475,13 @@ def dump_mlc_chat_config(
     config["top_p"] = top_p
     config["mean_gen_len"] = mean_gen_len
     config["max_gen_len"] = max_gen_len
+    config["max_window_size"] = max_window_size
+    config["num_shards"] = args.num_shards
     config["shift_fill_factor"] = shift_fill_factor
     config["tokenizer_files"] = utils.get_tokenizer_files(args.params_path)
     config["model_category"] = args.model_category
     config["model_name"] = args.model
+    config["vocab_size"] = vocab_size
 
     args.chat_config_path = os.path.join(args.params_path, "mlc-chat-config.json")
     with open(args.chat_config_path, "w", encoding="utf-8") as outfile:
@@ -478,12 +506,6 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
             else tvm.target.Target("apple/m1-gpu-restricted")
         )
         with dispatch_target:
-            if args.target_kind == "android":
-                mod_deploy = (
-                    mlc_llm.dispatch.DispatchTIROperatorAdreno()(  # pylint: disable=not-callable
-                        mod_deploy
-                    )
-                )
             mod_deploy = dl.ApplyDefaultSchedule(  # pylint: disable=not-callable
                 dl.gpu.Matmul(),
                 dl.gpu.GEMV(),
@@ -519,12 +541,39 @@ def build(mod_deploy: tvm.IRModule, args: argparse.Namespace) -> None:
     print(f"Finish exporting to {args.lib_path}")
 
 
+def dump_shard_info(args, param_manager):
+    if not args.build_model_only:
+        return
+    os.makedirs(os.path.join(args.artifact_path, "params"), exist_ok=True)
+    shard_info_path = os.path.join(args.artifact_path, "params", "shard_info.json")
+    shard_info_dict = {}
+    for _, param in param_manager.params.items():
+        shard_dim = param.shard_dim
+        if shard_dim is None:
+            continue
+        for i in param_manager.param2qrange[param]:
+            param_name = f"param_{i}"
+            shard_info_dict[param_name] = shard_dim
+    print(f"Finish exporting sharding information to {shard_info_path}")
+    with open(shard_info_path, "w", encoding="utf-8") as o_f:
+        json.dump(shard_info_dict, o_f)
+
+
 def build_model_from_args(args: argparse.Namespace):
     if args.quantization == "q4f16_0":
         print(
             "WARNING: q4f16_1 is preferred to q4f16_0, "
             "and it is highly recommended to use q4f16_1 instaed"
         )
+    if args.num_shards > 1:
+        if (args.build_model_only and args.convert_weight_only) or (
+            not args.build_model_only and not args.convert_weight_only
+        ):
+            raise ValueError(
+                "When num_shards > 1, precisely one of `build_model_only` and"
+                " `convert_weight_only` are expected to be set"
+            )
+
     os.makedirs(args.artifact_path, exist_ok=True)
     if args.debug_dump:
         os.makedirs(os.path.join(args.artifact_path, "debug"), exist_ok=True)
@@ -538,19 +587,19 @@ def build_model_from_args(args: argparse.Namespace):
             config = json.load(i_f)
     if not use_cache or args.convert_weight_only:
         if args.model_category == "llama":
-            mod, param_manager, params = llama.get_model(args, config)
+            mod, param_manager, params, model_config = llama.get_model(args, config)
         elif args.model_category == "gpt_neox":
-            mod, param_manager, params = gpt_neox.get_model(args, config)
+            mod, param_manager, params, model_config = gpt_neox.get_model(args, config)
         elif args.model_category == "gpt_bigcode":
-            mod, param_manager, params = gpt_bigcode.get_model(args, config)
+            mod, param_manager, params, model_config = gpt_bigcode.get_model(args, config)
         elif args.model_category == "minigpt":
-            mod, param_manager, params = minigpt.get_model(args)
+            mod, param_manager, params, model_config = minigpt.get_model(args)
         elif args.model_category == "gptj":
-            mod, param_manager, params = gptj.get_model(args, config)
-        elif args.model_category == "rwkv":
-            mod, param_manager, params = rwkv.get_model(args, config)
+            mod, param_manager, params, model_config = gptj.get_model(args, config)
+        elif args.model_category == "rwkv" or args.model_category == "rwkv_world":
+            mod, param_manager, params, model_config = rwkv.get_model(args, config)
         elif args.model_category == "chatglm":
-            mod, param_manager, params = chatglm.get_model(args, config)
+            mod, param_manager, params, model_config = chatglm.get_model(args, config)
         else:
             raise ValueError(f"Model {args.model} not supported")
 
@@ -563,16 +612,28 @@ def build_model_from_args(args: argparse.Namespace):
             utils.save_params(new_params, args.artifact_path)
             if args.model_category != "minigpt":
                 utils.copy_tokenizer(args)
-            if args.model_category == "rwkv":
+            if args.model_category == "rwkv" or args.model_category == "rwkv_world":
                 # TODO: refactor config into model definition
-                dump_mlc_chat_config(args, top_p=0.6, temperature=1.2, repetition_penalty=0.996)
+                dump_mlc_chat_config(
+                    args,
+                    vocab_size=config["vocab_size"],
+                    max_window_size=model_config.max_sequence_length,
+                    top_p=0.6,
+                    temperature=1.2,
+                    repetition_penalty=0.996,
+                )
             else:
-                dump_mlc_chat_config(args)
+                dump_mlc_chat_config(
+                    args,
+                    vocab_size=config["vocab_size"],
+                    max_window_size=model_config.max_sequence_length,
+                )
 
         if args.convert_weight_only:
             exit(0)
 
-        mod = mod_transform_before_build(mod, param_manager, args, config)
+        mod = mod_transform_before_build(mod, param_manager, args, model_config)
+        dump_shard_info(args, param_manager)
         with open(cache_path, "wb") as outfile:
             pickle.dump(mod, outfile)
         print(f"Save a cached module to {cache_path}.")

@@ -12,7 +12,6 @@ from .quantization import quantization_schemes
 from .relax_model import param_manager
 from .transform import ReorderTransformFunc
 
-
 supported_model_types = set(
     ["llama", "gpt_neox", "gpt_bigcode", "minigpt", "moss", "rwkv", "gptj", "chatglm"]
 )
@@ -36,15 +35,21 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
         "moss-moon-003-sft": "gptj",
         "moss-moon-003-base": "gptj",
         "rwkv-": "rwkv",
+        "rwkv_world": "rwkv_world",
         "minigpt": "minigpt",
     }
     try:
         with open(os.path.join(args.model_path, "config.json"), encoding="utf-8") as i_f:
             config = json.load(i_f)
             args.model_category = config["model_type"]
+        model_path_lower = args.model_path.lower()
+        if "rwkv" in model_path_lower and "world" in model_path_lower:
+            args.model_category = "rwkv_world"
     except Exception:
         args.model_category = ""
     model = args.model.lower()
+    if "rwkv" in model and "world" in model:
+        model = "rwkv_world"
     for prefix, override_category in model_category_override.items():
         if model.startswith(prefix):
             args.model_category = override_category
@@ -53,6 +58,10 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
 
     model_conv_templates = {
         "llama-2": "llama-2",
+        "codellama-7b-instruct": "codellama_instruct",
+        "codellama-13b-instruct": "codellama_instruct",
+        "codellama-34b-instruct": "codellama_instruct",
+        "codellama": "codellama_completion",
         "vicuna-": "vicuna_v1.1",
         "dolly-": "dolly",
         "stablelm-": "stablelm",
@@ -63,6 +72,7 @@ def argparse_postproc_common(args: argparse.Namespace) -> None:
         "gpt-j-": "LM",
         "open_llama": "LM",
         "rwkv-": "rwkv",
+        "rwkv_world": "rwkv_world",
         "gorilla-": "gorilla",
         "guanaco": "guanaco",
         "wizardlm-7b": "wizardlm_7b",  # first get rid of 7b
@@ -105,11 +115,13 @@ def debug_dump_benchmark_script(
     args: argparse.Namespace,
 ) -> None:
     """Extract model level benchmark workloads from relax model."""
-    from tvm.dlight.benchmark import extract_all_func_info_from_relax
-
     if not args.debug_dump:
         return
-    # pylint: disable=import-error,import-outside-toplevel
+
+    from tvm.dlight.benchmark import (  # pylint: disable=import-error,import-outside-toplevel
+        extract_all_func_info_from_relax,
+    )
+
     dump_path = os.path.join(args.artifact_path, "debug", name + ".py")
     with open(dump_path, "w", encoding="utf-8") as outfile:
         outfile.write(
@@ -146,6 +158,7 @@ def debug_dump_benchmark_script(
         outfile.write("\n" + "\n".join(stmt) + "\n")
     print(f"Dump benchmarking script to {dump_path}.")
 
+
 def debug_load_script(name: str, args: argparse.Namespace):
     input_path = os.path.join(args.artifact_path, "debug", name)
     lib = {"__file__": input_path}
@@ -178,6 +191,21 @@ def convert_weights(
     model_params: List[Optional[tvm.nd.NDArray]],
     args: argparse.Namespace,
 ):
+    # Run pre-quantization if provided.
+    if param_mgr.f_run_prequantize is not None:
+        args.model_path = param_mgr.f_run_prequantize(args.model_path)
+        param_mgr.model_path = args.model_path
+    param_mgr.torch_pname2binname = (
+        param_manager.load_torch_pname2binname_map(
+            args.model_path,
+            args.use_safetensors,
+            set(param_mgr.pidx2pname.values()),
+            param_mgr.f_convert_pname_fwd,
+        )
+        if len(param_mgr.pidx2pname) != 0
+        else dict()
+    )
+
     # Create the quantization function.
     # We first create an initial one, then reorder it according to each
     # weight's location in the binary files, in the purpose of reducing
@@ -420,6 +448,22 @@ def parse_target(args: argparse.Namespace) -> None:
         args.target_kind = args.target.kind.default_keys[0]
         if multiarch:
             args.target_kind += "-multiarch"
+    elif args.target.startswith("nvidia/jetson"):
+        try:
+            args.target = tvm.target.Target(args.target)
+        except ValueError:
+            raise ValueError("Cannot find configuration of given nvidia/jetson board target!")
+        if not hasattr(args, "cc_path") or args.cc_path == "":
+            args.cc_path = "/usr/bin/aarch64-linux-gnu-g++"
+        from tvm.contrib.cc import (  # pylint: disable=import-outside-toplevel
+            cross_compiler,
+        )
+        args.export_kwargs = {
+            "fcompile": cross_compiler(
+                args.cc_path,
+            ),
+        }
+        args.target_kind = args.target.kind.default_keys[0]
     elif args.target == "metal":
         target = _detect_local_metal()
         if target is None:

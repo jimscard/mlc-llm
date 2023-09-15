@@ -148,7 +148,7 @@ We can check the output with the commands below:
         .. code:: shell
 
             # Run CLI
-            mlc_chat_cli --local-id RedPajama-INCITE-Chat-3B-v1-q4f16_1
+            mlc_chat_cli --model RedPajama-INCITE-Chat-3B-v1-q4f16_1
 
        The CLI will use the config file ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/params/mlc-chat-config.json``
        and model library ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/RedPajama-INCITE-Chat-3B-v1-q4f16_1-metal.so``.
@@ -177,7 +177,7 @@ We can check the output with the commands below:
         .. code:: shell
 
             # Run CLI
-            mlc_chat_cli --local-id RedPajama-INCITE-Chat-3B-v1-q4f16_1
+            mlc_chat_cli --model RedPajama-INCITE-Chat-3B-v1-q4f16_1
 
         The CLI app using config file ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/params/mlc-chat-config.json``
         and model library ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/RedPajama-INCITE-Chat-3B-v1-q4f16_1-cuda.so``.
@@ -205,7 +205,7 @@ We can check the output with the commands below:
         .. code:: shell
 
             # Run CLI
-            mlc_chat_cli --local-id RedPajama-INCITE-Chat-3B-v1-q4f16_1
+            mlc_chat_cli --model RedPajama-INCITE-Chat-3B-v1-q4f16_1
 
         CLI app will use config file ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/params/mlc-chat-config.json``
         and model library ``dist/RedPajama-INCITE-Chat-3B-v1-q4f16_1/RedPajama-INCITE-Chat-3B-v1-q4f16_1-vulkan.so`` (or ``.dll``).
@@ -414,6 +414,13 @@ This section lists compile commands for more models that you can try out.
 
                     python3 -m mlc_llm.build --model Llama-2-7b-chat-hf --target iphone --max-seq-len 768 --quantization q3f16_1
 
+            .. tab:: Android
+
+                .. code:: shell
+
+                    python3 -m mlc_llm.build --model Llama-2-7b-chat-hf --target android --max-seq-len 768 --quantization q4f16_1
+
+
     .. tab:: Vicuna-v1-7B
 
         Please check this page on :doc:`how to get the Vicuna model weights </compilation/get-vicuna-weight>`.
@@ -470,7 +477,7 @@ This section lists compile commands for more models that you can try out.
 
                 .. code:: shell
 
-                    python3 -m mlc_llm.build --model vicuna-v1-7b --target android --max-seq-len 768 --quantization q4f16_0
+                    python3 -m mlc_llm.build --model vicuna-v1-7b --target android --max-seq-len 768 --quantization q4f16_1
 
     .. tab:: RedPajama-v1-3B
 
