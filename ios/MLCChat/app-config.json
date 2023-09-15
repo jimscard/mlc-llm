@@ -7,6 +7,10 @@
     {
       "model_url": "https://huggingface.co/mlc-ai/mlc-chat-RedPajama-INCITE-Chat-3B-v1-q4f16_1/",
       "local_id": "RedPajama-INCITE-Chat-3B-v1-q4f16_1"
+    },
+    {
+      "model_url": "https://huggingface.co/acalatrava/mlc-chat-luna-ai-llama2-7b-chat-uncensored-q3f16_1",
+      "local_id": "Luna AI uncensored"
     }
   ],
   "add_model_samples": [
