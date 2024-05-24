@@ -125,10 +125,15 @@ class BatchDecodeActionObj : public EngineActionObj {
     // - Update the committed tokens of states.
     for (int i = 0; i < num_rsentries; ++i) {
       mstates[i]->CommitToken(sample_results[i]);
+      // Metrics update
+      // live update the output metrics
+      running_rsentries[i]->rstate->metrics.num_output_tokens += 1;
     }
 
     auto tend = std::chrono::high_resolution_clock::now();
-    estate->stats.engine_total_decode_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    double elapsed_time = static_cast<double>((tend - tstart).count()) / 1e9;
+    estate->metrics.engine_decode_time_sum += elapsed_time;
+    estate->metrics.UpdateDecodeTimeByBatchSize(num_rsentries, elapsed_time);
 
     return estate->running_queue;
   }

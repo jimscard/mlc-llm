@@ -1,5 +1,4 @@
 """Python entrypoint of chat."""
-
 from typing import List, Optional
 
 from prompt_toolkit import prompt as get_prompt  # pylint: disable=import-error
@@ -13,6 +12,8 @@ class ChatState:
 
     history: List[dict]
     history_begin: int
+    # kwargs passed to completions
+    overrides: dict
     # we use JSON ffi engine to ensure broader coverage
     engine: JSONFFIEngine
 
@@ -20,13 +21,14 @@ class ChatState:
         self.engine = engine
         self.history = []
         self.history_window_begin = 0
+        self.overrides = {}
 
     def process_system_prompts(self):
         """Process system prompts"""
         # TODO(mlc-team): possibly leverage debug option
         # pass a simple prompt to warm up
         for _ in self.engine.chat.completions.create(
-            messages=[{"role": "user", "content": "hello"}], max_tokens=1, stream=True
+            messages=[{"role": "user", "content": ""}], max_tokens=1, stream=True
         ):
             pass
 
@@ -42,7 +44,9 @@ class ChatState:
         output_text = ""
         finish_reason_length = False
         messages = self.history[self.history_window_begin :]
-        for response in self.engine.chat.completions.create(messages=messages, stream=True):
+        for response in self.engine.chat.completions.create(
+            messages=messages, stream=True, **self.overrides
+        ):
             for choice in response.choices:
                 assert choice.delta.role == "assistant"
                 if isinstance(choice.delta.content, str):
@@ -59,17 +63,32 @@ class ChatState:
         if finish_reason_length:
             self.slide_history()
 
+    def stats(self) -> str:
+        """Return the statistics of the prefill and decode speed."""
+        metrics = self.engine.metrics()
+        last_finished_request = metrics["last_finished_request"]
+        prefill_speed = last_finished_request.get("prefill_tokens_per_s", None)
+        decode_speed = last_finished_request.get("decode_tokens_per_s", None)
+        prefill_speed = f"{prefill_speed:.1f}" if prefill_speed is not None else "N/A"
+        decode_speed = f"{decode_speed:.1f}" if decode_speed is not None else "N/A"
+        return f"prefill: {prefill_speed} tok/s, decode: {decode_speed} tok/s"
+
+    def metrics(self) -> str:
+        """Return metrics as prometheus text"""
+        return self.engine.metrics().prometheus_text()
+
     def reset_chat(self):
         """Reset the chat history"""
         self.history = []
         self.history_window_begin = 0
 
 
-# TODO(mlc-team): add back support for stats
 def _print_help_str():
     help_str = """You can use the following special commands:
   /help               print the special commands
   /exit               quit the cli
+  /stats              print out stats of last request (token/sec)
+  /metrics            print out full engine metrics
   /reset              restart a fresh chat
   Multi-line input: Use escape+enter to start a new line.
 """
@@ -113,7 +132,11 @@ def chat(
             key_bindings=kb,
             multiline=True,
         )
-        if prompt[:6] == "/reset":
+        if prompt[:6] == "/stats":
+            print(chat_state.stats(), flush=True)
+        elif prompt[:8] == "/metrics":
+            print(chat_state.metrics(), flush=True)
+        elif prompt[:6] == "/reset":
             chat_state.reset_chat()
         elif prompt[:5] == "/exit":
             break

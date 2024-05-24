@@ -73,14 +73,17 @@ class Engine {
                                              Optional<PackedFunc> request_stream_callback,
                                              Optional<EventTraceRecorder> trace_recorder);
 
-  /*! \brief Reset the engine, clean up all running data and statistics. */
+  /*! \brief Reset the engine, clean up all running data and metrics. */
   virtual void Reset() = 0;
 
   /*! \brief Check if the engine has no request to process. */
   virtual bool Empty() = 0;
 
-  /*! \brief Get the statistics of the Engine in JSON string. */
-  virtual String Stats() = 0;
+  /*!
+   * \brief Get the metrics of the Engine in JSON string.
+   * \return the metrics
+   */
+  virtual String JSONMetrics() = 0;
 
   /*! \brief Get the request stream callback function of the engine. */
   virtual Optional<PackedFunc> GetRequestStreamCallback() = 0;

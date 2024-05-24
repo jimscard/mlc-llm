@@ -53,10 +53,10 @@ class BatchVerifyActionObj : public EngineActionObj {
       return {};
     }
 
+    auto tstart = std::chrono::high_resolution_clock::now();
     int num_rsentries = rsentries.size();
     Array<String> request_ids =
         rsentries.Map([](const RequestStateEntry& rstate) { return rstate->request->id; });
-    auto tstart = std::chrono::high_resolution_clock::now();
 
     // - Get embedding and run verify.
     std::vector<int64_t> request_internal_ids;
@@ -147,9 +147,11 @@ class BatchVerifyActionObj : public EngineActionObj {
         rsentries[i]->mstates[verify_model_id_]->CommitToken(sample_result);
         rsentries[i]->mstates[draft_model_id_]->CommitToken(sample_result);
       }
-      estate->stats.total_accepted_length += accept_length;
-      estate->stats.UpdateSpecDecodingStats(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
-                                            accept_length);
+      // Metrics update
+      // live update the output metrics
+      rsentries[i]->rstate->metrics.num_output_tokens += accept_length;
+      estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
+                                         accept_length);
       int rollback_length =
           std::max(cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length, 0);
       // rollback kv cache
@@ -208,7 +210,9 @@ class BatchVerifyActionObj : public EngineActionObj {
     }
 
     auto tend = std::chrono::high_resolution_clock::now();
-    estate->stats.engine_total_decode_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    double elapsed_time = static_cast<double>((tend - tstart).count()) / 1e9;
+    estate->metrics.engine_decode_time_sum += elapsed_time;
+    estate->metrics.UpdateVerifyTimeByBatchSize(total_verify_length, elapsed_time);
 
     return estate->running_queue;
   }

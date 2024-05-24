@@ -6,6 +6,7 @@
 #ifndef MLC_LLM_SERVE_THREADED_ENGINE_H_
 #define MLC_LLM_SERVE_THREADED_ENGINE_H_
 
+#include <picojson.h>
 #include <tvm/runtime/packed_func.h>
 
 #include "data.h"
@@ -75,14 +76,14 @@ class ThreadedEngine {
 
   /************** Query/Profile/Debug **************/
 
-  /*! \brief Return the default generation config JSON string. */
-  virtual String GetDefaultGenerationConfigJSONString() const = 0;
+  /*! \brief Return the default generation config. */
+  virtual GenerationConfig GetDefaultGenerationConfig() const = 0;
 
-  /*! \brief Return the complete engine config JSON string. */
-  virtual String GetCompleteEngineConfigJSONString() const = 0;
+  /*! \brief Return the complete engine config. */
+  virtual EngineConfig GetCompleteEngineConfig() const = 0;
 
-  /*! \brief Print the statistics of the engine. */
-  virtual String Stats() = 0;
+  /*! \brief Print the metrics of the engine. */
+  virtual String JSONMetrics() = 0;
 
   /*! \brief Call the given global function on all workers. Only for debug purpose. */
   virtual void DebugCallFuncOnAllAllWorker(const String& func_name) = 0;

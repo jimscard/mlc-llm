@@ -99,15 +99,13 @@ class EngineImpl : public Engine {
     }
     EngineConfig engine_config = engine_config_res.Unwrap();
     {
-      EngineState estate = n->estate_;
-      Array<Model> models = n->models_;
       if (engine_config->prefix_cache_mode == PrefixCacheMode::kRadix) {
         n->estate_->prefix_cache = PrefixCache::CreateRadixPrefixCache(
             static_cast<size_t>(engine_config->prefix_cache_max_num_recycling_seqs),
-            std::function<void(int64_t)>([estate, models](int64_t seq_id) {
-              RemoveRequestFromModel(estate, seq_id, models);
-              estate->id_manager.RecycleId(seq_id);
-            }));
+            [engine_ptr = n.get()](int64_t seq_id) {
+              RemoveRequestFromModel(engine_ptr->estate_, seq_id, engine_ptr->models_);
+              engine_ptr->estate_->id_manager.RecycleId(seq_id);
+            });
       } else if (engine_config->prefix_cache_mode == PrefixCacheMode::kDisable) {
         n->estate_->prefix_cache = PrefixCache::CreateNoPrefixCache();
       } else {
@@ -238,7 +236,7 @@ class EngineImpl : public Engine {
 
   bool Empty() final { return estate_->request_states.empty(); }
 
-  String Stats() final { return estate_->stats.AsJSON(); }
+  String JSONMetrics() final { return estate_->metrics.AsJSON().serialize(true); }
 
   Optional<PackedFunc> GetRequestStreamCallback() final { return request_stream_callback_; }
 
@@ -250,11 +248,13 @@ class EngineImpl : public Engine {
 
   void AddRequest(Request request) final {
     RECORD_EVENT(trace_recorder_, request->id, "request added to engine");
+    auto add_time_point = std::chrono::high_resolution_clock::now();
+
     // Get a request copy where all text inputs are tokenized.
     request = Request::FromUntokenized(request, tokenizer_);
-    ICHECK_NE(request->input_total_length, -1);
+    ICHECK_NE(request->num_input_tokens, -1);
 
-    if (request->input_total_length >= engine_config_->max_single_sequence_length &&
+    if (request->num_input_tokens >= engine_config_->max_single_sequence_length &&
         request_stream_callback_.defined()) {
       // If the request input length exceeds the maximum allowed single sequence length,
       // invoke callback and do not process the request.
@@ -290,7 +290,13 @@ class EngineImpl : public Engine {
                                /*parent_idx=*/0);
       }
     }
-    estate_->request_states.emplace(request->id, RequestState(std::move(rsentries)));
+    RequestState rstate = RequestState(std::move(rsentries), add_time_point);
+    for (const RequestStateEntry& rsentry : rstate->entries) {
+      // Set the back reference.
+      // note, we avoid cyclic reference and use raw ptr.
+      rsentry->rstate = rstate.operator->();
+    }
+    estate_->request_states.emplace(request->id, rstate);
   }
 
   void AbortRequest(const String& request_id) final {
@@ -566,14 +572,13 @@ class EngineModule : public ModuleNode {
   TVM_MODULE_VTABLE_BEGIN("mlc.serve.engine");
   TVM_MODULE_VTABLE_ENTRY("init", &EngineModule::Init);
   TVM_MODULE_VTABLE_ENTRY("add_request", &EngineModule::AddRequest);
+  TVM_MODULE_VTABLE_ENTRY("create_request", &EngineModule::CreateRequest);
   TVM_MODULE_VTABLE_ENTRY("abort_request", &EngineModule::Abort);
   TVM_MODULE_VTABLE_ENTRY("step", &EngineModule::Step);
-  TVM_MODULE_VTABLE_ENTRY("stats", &EngineModule::Stats);
+  TVM_MODULE_VTABLE_ENTRY("json_metrics", &EngineModule::JSONMetrics);
   TVM_MODULE_VTABLE_ENTRY("reset", &EngineModule::Reset);
   TVM_MODULE_VTABLE_ENTRY("get_request_stream_callback", &EngineModule::GetRequestStreamCallback);
   TVM_MODULE_VTABLE_ENTRY("set_request_stream_callback", &EngineModule::SetRequestStreamCallback);
-  TVM_MODULE_VTABLE_ENTRY("get_default_generation_config",
-                          &EngineModule::GetDefaultGenerationConfigJSONString);
   TVM_MODULE_VTABLE_END();
 
   /*! \brief Initialize the engine with config and other fields. */
@@ -586,7 +591,7 @@ class EngineModule : public ModuleNode {
     CHECK(output_res.IsOk()) << output_res.UnwrapErr();
     EngineCreationOutput output = output_res.Unwrap();
     this->engine_ = std::move(output.reloaded_engine);
-    this->default_generation_cfg_json_str_ = output.default_generation_cfg->AsJSONString();
+    this->default_generation_config_ = output.default_generation_cfg;
   }
   /*! \brief Construct an EngineModule. */
   static tvm::runtime::Module Create() { return Module(make_object<EngineModule>()); }
@@ -594,6 +599,12 @@ class EngineModule : public ModuleNode {
   void AddRequest(Request request) { return GetEngine()->AddRequest(std::move(request)); }
   /*! \brief Redirection to `Engine::AbortRequest`. */
   void Abort(const String& request_id) { return GetEngine()->AbortRequest(request_id); }
+
+  Request CreateRequest(String id, Array<Data> inputs, String generation_cfg_json_str) {
+    return Request(
+        std::move(id), std::move(inputs),
+        GenerationConfig(std::move(generation_cfg_json_str), default_generation_config_));
+  }
   /*! \brief Redirection to `Engine::Step`. */
   void Step() { return GetEngine()->Step(); }
   /*! \brief Redirection to `Engine::GetRequestStreamCallback`. */
@@ -606,14 +617,8 @@ class EngineModule : public ModuleNode {
   }
   /*! \brief Redirection to `Engine::Reset`. */
   void Reset() { return GetEngine()->Reset(); }
-  /*! \brief Redirection to `Engine::Stats` */
-  String Stats() { return GetEngine()->Stats(); }
-  /*! \brief Return the default generation config string. */
-  String GetDefaultGenerationConfigJSONString() {
-    CHECK(!default_generation_cfg_json_str_.empty())
-        << "The default generation config has not been set.";
-    return default_generation_cfg_json_str_;
-  }
+  /*! \brief Redirection to `Engine::Metrics` */
+  String JSONMetrics() { return GetEngine()->JSONMetrics(); }
 
  private:
   Engine* GetEngine() {
@@ -622,7 +627,7 @@ class EngineModule : public ModuleNode {
   }
 
   std::unique_ptr<Engine> engine_ = nullptr;
-  String default_generation_cfg_json_str_;
+  GenerationConfig default_generation_config_;
 };
 
 TVM_REGISTER_GLOBAL("mlc.serve.create_engine").set_body_typed(EngineModule::Create);

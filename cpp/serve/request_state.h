@@ -16,6 +16,7 @@
 #include "../support/random.h"
 #include "config.h"
 #include "grammar/grammar_state_matcher.h"
+#include "metrics.h"
 #include "request.h"
 
 namespace mlc {
@@ -160,6 +161,9 @@ enum class RequestStateStatus : int {
   kFinished = 2,
 };
 
+// forward declare request state node.
+class RequestStateNode;
+
 /*!
  * \brief A request's state entry. It contains the state of a single
  * generation of a request, or the state of a prompt prefix of a request.
@@ -194,10 +198,11 @@ class RequestStateEntryNode : public Object {
    */
   int next_callback_token_pos;
 
-  /*! \brief The time of adding the request to engine. */
-  std::chrono::high_resolution_clock::time_point tadd;
-  /*! \brief The time of finishing prefill stage. */
-  std::chrono::high_resolution_clock::time_point tprefill_finish;
+  /*!
+   * \brief Back reference to the request state.
+   * Use ObjectRef to avoid circulate reference.
+   */
+  RequestStateNode* rstate = nullptr;
 
   /*!
    * \brief Get the delta token ids and the logprob JSON strings for this request to return since
@@ -231,7 +236,10 @@ class RequestStateEntry : public ObjectRef {
 /*! \brief A request's state, which groups all the request state entries. */
 class RequestStateNode : public Object {
  public:
+  /*! \brief the reuqest state entries */
   std::vector<RequestStateEntry> entries;
+  /*! \brief tracks the request metrics. */
+  RequestMetrics metrics;
 
   static constexpr const char* _type_key = "mlc.serve.RequestState";
   static constexpr const bool _type_has_method_sequal_reduce = false;
@@ -241,7 +249,8 @@ class RequestStateNode : public Object {
 
 class RequestState : public ObjectRef {
  public:
-  explicit RequestState(std::vector<RequestStateEntry> entries);
+  explicit RequestState(std::vector<RequestStateEntry> entries,
+                        std::chrono::high_resolution_clock::time_point add_time_point);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestState, ObjectRef, RequestStateNode);
 };

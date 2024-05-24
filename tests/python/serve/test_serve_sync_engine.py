@@ -5,7 +5,7 @@ from typing import Callable, List, Optional
 import numpy as np
 
 from mlc_llm.serve import GenerationConfig, Request, RequestStreamOutput, data
-from mlc_llm.serve.sync_engine import SyncMLCEngine
+from mlc_llm.serve.sync_engine import EngineConfig, SyncMLCEngine
 
 prompts = [
     "What is the meaning of life?",
@@ -22,6 +22,7 @@ prompts = [
 
 
 def create_requests(
+    engine: SyncMLCEngine,
     num_requests: int,
     stop_token_id: Optional[int] = None,
     temperature: float = 0.8,
@@ -36,7 +37,7 @@ def create_requests(
     for req_id, prompt in zip(range(num_requests), prompts):
         max_tokens = np.random.randint(max_tokens_low, max_tokens_high)
         requests.append(
-            Request(
+            engine.create_request(
                 request_id=str(req_id),
                 inputs=data.TextData(prompt),
                 generation_config=GenerationConfig(
@@ -87,6 +88,7 @@ def test_engine_basic():
 
     # Create requests
     requests = create_requests(
+        engine,
         num_requests,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
@@ -161,6 +163,7 @@ def test_engine_continuous_batching_1():
 
     # Create requests
     requests = create_requests(
+        engine,
         num_requests,
         temperature=temperature,
         repetition_penalty=repetition_penalty,
@@ -240,6 +243,7 @@ def test_engine_continuous_batching_2():
 
     # Create requests
     requests = create_requests(
+        engine,
         num_requests,
         stop_token_id=stop_token_id,
         temperature=temperature,
@@ -324,6 +328,7 @@ def test_engine_continuous_batching_3():
 
     # Create requests
     requests = create_requests(
+        engine,
         num_requests,
         stop_token_id=stop_token_id,
         temperature=temperature,
@@ -359,7 +364,7 @@ def test_engine_generate():
     engine = SyncMLCEngine(
         model=model,
         mode="server",
-        max_total_sequence_length=4096,
+        engine_config=EngineConfig(max_total_sequence_length=4096),
     )
 
     num_requests = 10

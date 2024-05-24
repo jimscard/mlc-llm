@@ -109,6 +109,8 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
                              current_total_seq_len, num_running_rsentries, kv_state_kind,
                              sliding_window_enabled)) {
             if (!estate->prefix_cache->TryFreeMemory()) break;
+            // Update number of available pages after memory free.
+            num_available_pages = models_[i]->GetNumAvailablePages();
           }
           if (CanPrefill(estate, num_prefill_rsentries + 1 + num_child_to_activate,
                          total_input_length, total_required_pages, num_available_pages,
@@ -173,6 +175,10 @@ BatchPrefillBaseActionObj::GetRequestStateEntriesToPrefill(EngineState estate) {
   for (int i = 1; i < static_cast<int>(prefill_inputs_for_all_models.size()); ++i) {
     num_prefill_inputs =
         std::min(num_prefill_inputs, static_cast<int>(prefill_inputs_for_all_models[i].size()));
+  }
+
+  if (num_prefill_inputs == 0) {
+    return {};
   }
 
   std::vector<PrefillInput> prefill_inputs(
@@ -397,8 +403,10 @@ void BatchPrefillBaseActionObj::UpdateRequestStateEntriesWithSampleResults(
             TokenData(std::vector<int64_t>{sample_results[i].sampled_token_id.first}));
       }
     }
+    // prefill has finished
     if (rsentries_for_sample[i]->mstates[0]->committed_tokens.size() == 1) {
-      rsentries_for_sample[i]->tprefill_finish = tnow;
+      ICHECK(rsentries_for_sample[i]->rstate != nullptr);
+      rsentries_for_sample[i]->rstate->metrics.prefill_end_time_point = tnow;
     }
   }
 }

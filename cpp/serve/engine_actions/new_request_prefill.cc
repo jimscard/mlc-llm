@@ -226,7 +226,7 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
                                                sample_results);
 
     auto tend = std::chrono::high_resolution_clock::now();
-    estate->stats.engine_total_prefill_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    estate->metrics.engine_prefill_time_sum += static_cast<double>((tend - tstart).count()) / 1e9;
 
     std::vector<Request> processed_requests =
         RemoveProcessedRequests(prefill_inputs, estate, rstates_of_entries);
@@ -250,6 +250,9 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
    */
   void MatchPrefixCache(EngineState estate, PrefillInput* input) final {
     RequestStateEntry rsentry = input->rsentry;
+    if (estate->prefix_cache->Mode() == PrefixCacheMode::kDisable) {
+      return;
+    }
     if (rsentry->parent_idx == -1 && rsentry->status == RequestStateStatus::kPending &&
         !estate->prefix_cache->HasSequence(rsentry->mstates[0]->internal_id)) {
       IntTuple tokens = GetConcatPrefillInputData(rsentry->mstates[0]);

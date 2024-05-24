@@ -106,14 +106,14 @@ RequestStateEntry::RequestStateEntry(
   }
   n->status = RequestStateStatus::kPending;
   n->rng = RandomGenerator(rng_seed);
-  n->stop_str_handler = StopStrHandler(
-      !request->generation_cfg->ignore_eos ? request->generation_cfg->stop_strs : Array<String>(),
-      token_table);
+  n->stop_str_handler = StopStrHandler(!request->generation_cfg->debug_config.ignore_eos
+                                           ? request->generation_cfg->stop_strs
+                                           : Array<String>(),
+                                       token_table);
   n->request = std::move(request);
   n->parent_idx = parent_idx;
   n->mstates = std::move(mstates);
   n->next_callback_token_pos = 0;
-  n->tadd = std::chrono::high_resolution_clock::now();
   data_ = std::move(n);
 }
 
@@ -149,7 +149,7 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
   // Case 3. Any of the stop tokens appears in the committed tokens ===> Finished
   // `stop_token_ids` includes the stop tokens from conversation template and user-provided tokens.
   // This check will be ignored when `ignore_eos` is set for the benchmarking purpose.
-  if (!request->generation_cfg->ignore_eos) {
+  if (!request->generation_cfg->debug_config.ignore_eos) {
     for (int i = 0; i < static_cast<int>(return_token_ids.size()); ++i) {
       if (std::any_of(
               request->generation_cfg->stop_token_ids.begin(),
@@ -186,7 +186,7 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
     return {return_token_ids, logprob_json_strs, String("length")};
   }
   // Case 6. Total length of the request reaches the maximum single sequence length ==> Finished
-  if (request->input_total_length + num_committed_tokens >= max_single_sequence_length) {
+  if (request->num_input_tokens + num_committed_tokens >= max_single_sequence_length) {
     std::vector<int32_t> remaining = stop_str_handler->Finish();
     return_token_ids.insert(return_token_ids.end(), remaining.begin(), remaining.end());
     return {return_token_ids, logprob_json_strs, String("length")};
@@ -198,9 +198,13 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
 
 TVM_REGISTER_OBJECT_TYPE(RequestStateNode);
 
-RequestState::RequestState(std::vector<RequestStateEntry> entries) {
+RequestState::RequestState(std::vector<RequestStateEntry> entries,
+                           std::chrono::high_resolution_clock::time_point add_time_point) {
+  ICHECK(!entries.empty());
   ObjectPtr<RequestStateNode> n = make_object<RequestStateNode>();
   n->entries = std::move(entries);
+  n->metrics.num_input_tokens = n->entries[0]->request->num_input_tokens;
+  n->metrics.add_time_point = add_time_point;
   data_ = std::move(n);
 }
 
