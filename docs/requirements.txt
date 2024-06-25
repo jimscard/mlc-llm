@@ -12,3 +12,4 @@ uvicorn
 fastapi
 --find-links https://mlc.ai/wheels
 mlc-ai-nightly
+anyio>=4.4.0 # not directly required, pinned by Snyk to avoid a vulnerability
