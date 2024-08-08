@@ -1,12 +1,10 @@
 """Python entrypoint of compilation."""
 
 import dataclasses
-import math
 from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import numpy as np
 from tvm import IRModule, relax, tir
 from tvm.ir.transform import Pass, PassContext
 from tvm.relax.frontend import nn
@@ -61,12 +59,12 @@ class CompileArgs:  # pylint: disable=too-many-instance-attributes
         print(out.getvalue().rstrip())
 
 
-def _apply_preproc_to_params(
+def _apply_preproc_to_params_and_check_pipeline(
     named_params: List[Tuple[str, nn.Parameter]],
     model_config,
 ) -> Dict[str, tir.PrimFunc]:
     extra_tirs: Dict[str, tir.PrimFunc] = {}
-    for _, param in named_params:
+    for name, param in named_params:
         preprocs = param.attrs.get("preprocs", [])
         shard_strategy = param.attrs.get("shard_strategy", None)
         if shard_strategy is not None and model_config.tensor_parallel_shards > 1:
@@ -82,6 +80,18 @@ def _apply_preproc_to_params(
                     weight=param,
                 )
         param.attrs["preprocs"] = preprocs
+
+        pipeline_parallel_stages = getattr(model_config, "pipeline_parallel_stages", 1)
+        if pipeline_parallel_stages != 1:
+            assert "pipeline_stages" in param.attrs, (
+                f'The pipeline stage is undefined for parameter "{name}" when the number '
+                f"of pipeline parallel stages is {pipeline_parallel_stages}"
+            )
+        param.attrs["pipeline_stages"] = (
+            [0]
+            if "pipeline_stages" not in param.attrs
+            else list(set(param.attrs["pipeline_stages"]))
+        )
     return extra_tirs
 
 
@@ -115,24 +125,8 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
             "shape": [s if isinstance(s, int) else s.name for s in param.shape],
             "dtype": param.dtype,
             "preprocs": param.attrs["preprocs"],
+            "pipeline_stages": param.attrs.get("pipeline_stages", [0]),
         }
-
-    def _find_kv_cache_bytes(model: nn.Module, model_config) -> int:
-        all_kv_cache = nn.core._attribute_finder(  # pylint: disable=protected-access
-            model,
-            prefix="",
-            condition_yield=lambda x: isinstance(x, nn.KVCache),
-        )
-        result = 0
-        for _, kv_cache in all_kv_cache:
-            result += math.prod(kv_cache.unit_shape) * np.dtype(kv_cache.dtype).itemsize
-        if getattr(model_config, "sliding_window_size", -1) > 0:
-            window_size = model_config.sliding_window_size
-        elif getattr(model_config, "context_window_size", -1) > 0:
-            window_size = model_config.context_window_size
-        else:
-            window_size = 0
-        return result * window_size
 
     model_config = args.overrides.apply(model_config)
     with args.target:
@@ -160,7 +154,6 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
                 "KN layout (q3f16_0 and q4f16_0) is not supported for tensor parallelism"
             )
         model, _ = args.model.quantize[args.quantization.kind](model_config, args.quantization)
-        kv_cache_bytes = _find_kv_cache_bytes(model, model_config)
         # Step 2. Exporting the model to TVM Unity
         logger.info("Exporting the model to TVM Unity compiler")
         mod, named_params, ext_mods = model.export_tvm(
@@ -169,7 +162,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
         )
         # Step 3. Running relax compilation pipeline
         logger.info("Running optimizations using TVM Unity")
-        additional_tirs = _apply_preproc_to_params(named_params, model_config)
+        additional_tirs = _apply_preproc_to_params_and_check_pipeline(named_params, model_config)
         variable_bounds = _get_variable_bounds(model_config)
         cuda_graph_symbolic_capture_hints = {
             "batch_decode": ["batch_size"],
@@ -185,8 +178,9 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
             "attention_sink_size": getattr(model_config, "attention_sink_size", -1),
             "prefill_chunk_size": model_config.prefill_chunk_size,  # type: ignore
             "tensor_parallel_shards": model_config.tensor_parallel_shards,  # type: ignore
-            "kv_cache_bytes": kv_cache_bytes,
+            "pipeline_parallel_stages": getattr(model_config, "pipeline_parallel_stages", 1),
             "kv_state_kind": _infer_kv_state_kind(args.model.name),
+            "max_batch_size": getattr(model_config, "max_batch_size", 1),
         }
         logger.info("Registering metadata: %s", metadata)
         metadata["params"] = [_get_param_metadata(name, param) for name, param in named_params]

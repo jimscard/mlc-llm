@@ -95,12 +95,16 @@ class EngineAction : public ObjectRef {
    * decoding in the future, we will use other specific actions.
    * \param models The model to run decode in. When there are multiple
    * models, the `Step` function of the created action will not take effect.
+   * \param tokenizer The tokenizer of the engine.
    * \param sampler The sampler to sample new tokens.
+   * \param engine_config The engine config.
    * \param trace_recorder The event trace recorder for requests.
    * \return The created action object.
    */
-  static EngineAction BatchDecode(Array<Model> models, LogitProcessor logit_processor,
-                                  Sampler sampler, Optional<EventTraceRecorder> trace_recorder);
+  static EngineAction BatchDecode(Array<Model> models, Tokenizer tokenizer,
+                                  LogitProcessor logit_processor, Sampler sampler,
+                                  EngineConfig engine_config,
+                                  Optional<EventTraceRecorder> trace_recorder);
 
   /*!
    * \brief Create the action that runs one-step speculative draft proposal for
@@ -111,6 +115,7 @@ class EngineAction : public ObjectRef {
    * \param sampler The sampler to sample new tokens.
    * \param model_workspaces The workspace of each model.
    * \param draft_token_workspace_manager The draft token workspace manager.
+   * \param engine_config The engine config.
    * \param trace_recorder The event trace recorder for requests.
    * \param draft_length The number of draft proposal rounds.
    * \return The created action object.
@@ -118,6 +123,7 @@ class EngineAction : public ObjectRef {
   static EngineAction BatchDraft(Array<Model> models, LogitProcessor logit_processor,
                                  Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                  DraftTokenWorkspaceManager draft_token_workspace_manager,
+                                 EngineConfig engine_config,
                                  Optional<EventTraceRecorder> trace_recorder, int draft_length);
 
   /*!
@@ -129,6 +135,7 @@ class EngineAction : public ObjectRef {
    * \param sampler The sampler to sample new tokens.
    * \param model_workspaces The workspace of each model.
    * \param draft_token_workspace_manager The draft token workspace manager.
+   * \param engine_config The engine config.
    * \param trace_recorder The event trace recorder for requests.
    * \param draft_length The number of draft proposal rounds.
    * \return The created action object.
@@ -136,6 +143,7 @@ class EngineAction : public ObjectRef {
   static EngineAction EagleBatchDraft(Array<Model> models, LogitProcessor logit_processor,
                                       Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                       DraftTokenWorkspaceManager draft_token_workspace_manager,
+                                      EngineConfig engine_config,
                                       Optional<EventTraceRecorder> trace_recorder,
                                       int draft_length = 4);
 
@@ -176,6 +184,19 @@ class EngineAction : public ObjectRef {
                                        std::vector<ModelWorkspace> model_workspaces,
                                        DraftTokenWorkspaceManager draft_token_workspace_manager,
                                        EngineConfig engine_config,
+                                       Optional<EventTraceRecorder> trace_recorder);
+  /*!
+   * \brief Create the action that executes the jump-forward decoding to predict the next tokens
+   * according to the grammar constraint. Does nothing for the requests without grammar. The
+   * predicted tokens will be fed to the next BatchDecode action. Retokenization may happen when
+   * the predicted string breaks the tokenization boundary.
+   * \param models The model to run decode in. When there are multiple
+   * models, the `Step` function of the created action will not take effect.
+   * \param tokenizer The tokenizer of the engine.
+   * \param trace_recorder The event trace recorder for requests.
+   * \return The created action object.
+   */
+  static EngineAction BatchJumpForward(Array<Model> models, Tokenizer tokenizer,
                                        Optional<EventTraceRecorder> trace_recorder);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(EngineAction, ObjectRef, EngineActionObj);

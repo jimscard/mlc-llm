@@ -1,5 +1,5 @@
 /*!
- * \file json_parser.h
+ * \file support/json_parser.h
  * \brief Helps to parse JSON strings and objects.
  */
 #ifndef MLC_LLM_SUPPORT_JSON_PARSER_H_
@@ -252,6 +252,16 @@ inline tvm::runtime::DataType Lookup(const picojson::array& json, int index) {
 
 template <>
 inline SymShapeTuple Lookup(const picojson::object& json, const std::string& key) {
+  return details::SymShapeTupleFromArray(Lookup<picojson::array>(json, key));
+}
+
+template <>
+inline SymShapeTuple LookupOrDefault(const picojson::object& json, const std::string& key,
+                                     const SymShapeTuple& default_value) {
+  auto it = json.find(key);
+  if (it == json.end() || it->second.is<picojson::null>()) {
+    return default_value;
+  }
   return details::SymShapeTupleFromArray(Lookup<picojson::array>(json, key));
 }
 

@@ -2,6 +2,7 @@
 This file specifies how MLC's QWen parameter maps from other formats, for example HuggingFace
 PyTorch, HuggingFace safetensors.
 """
+
 import functools
 
 import numpy as np
@@ -18,8 +19,8 @@ def huggingface(model_config: QWenConfig, quantization: Quantization) -> ExternM
 
     Parameters
     ----------
-    model_config : GPT2Config
-        The configuration of the GPT-2 model.
+    model_config : QWenConfig
+        The configuration of the Qwen model.
 
     quantization : Quantization
         The quantization configuration.

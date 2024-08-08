@@ -19,37 +19,157 @@ namespace mlc {
 namespace llm {
 namespace serve {
 
+uint64_t TotalDetectGlobalMemory(DLDevice device) {
+  // Get single-card GPU size.
+  TVMRetValue rv;
+  DeviceAPI::Get(device)->GetAttr(device, DeviceAttrKind::kTotalGlobalMemory, &rv);
+  int64_t gpu_size_bytes = rv;
+  // Since the memory size returned by the OpenCL runtime is smaller than the actual available
+  // memory space, we set a best available space so that MLC LLM can run 7B or 8B models on Android
+  // with OpenCL.
+  if (device.device_type == kDLOpenCL) {
+    int64_t min_size_bytes = 5LL * 1024 * 1024 * 1024;  //  Minimum size is 5 GB
+    gpu_size_bytes = std::max(gpu_size_bytes, min_size_bytes);
+  }
+  return gpu_size_bytes;
+}
+
+/****************** ResponseFormat ******************/
+
+Result<ResponseFormat> ResponseFormat::FromJSON(const picojson::object& config) {
+  using TResult = Result<ResponseFormat>;
+  ResponseFormat res;
+  res.type = json::LookupOrDefault<std::string>(config, "type", "text");
+
+  std::optional<std::string> schema = json::LookupOptional<std::string>(config, "schema");
+  if (schema.has_value()) {
+    res.schema = schema.value();
+  }
+
+  if (res.type != "text" && res.type != "function" && res.type != "json_object") {
+    return TResult::Error("Uknonwn response_format type " + res.type);
+  }
+
+  return TResult::Ok(res);
+}
+
+picojson::object ResponseFormat::AsJSON() const {
+  picojson::object config;
+  config["type"] = picojson::value(type);
+  if (schema.defined()) {
+    config["schema"] = picojson::value(schema.value().operator std::string());
+  }
+  return config;
+}
+
+/****************** DebugConfig ******************/
+
+Result<DebugConfig> DebugConfig::FromJSON(const picojson::object& config) {
+  using TResult = Result<DebugConfig>;
+  DebugConfig res;
+  res.ignore_eos = json::LookupOrDefault<bool>(config, "ignore_eos", false);
+  res.pinned_system_prompt = json::LookupOrDefault<bool>(config, "pinned_system_prompt", false);
+  std::string special_request = json::LookupOrDefault<std::string>(config, "special_request", "");
+  if (special_request.length() != 0) {
+    if (special_request == "query_engine_metrics") {
+      res.special_request = SpecialRequestKind::kQueryEngineMetrics;
+    } else {
+      return TResult::Error("Uknown special request " + special_request);
+    }
+  }
+  std::string grammar_execution_mode =
+      json::LookupOrDefault<std::string>(config, "grammar_execution_mode", "jump_forward");
+  if (grammar_execution_mode == "jump_forward") {
+    res.grammar_execution_mode = GrammarExecutionMode::kJumpForward;
+  } else if (grammar_execution_mode == "constraint") {
+    res.grammar_execution_mode = GrammarExecutionMode::kConstraint;
+  } else {
+    return TResult::Error("Uknown grammar execution mode " + grammar_execution_mode);
+  }
+  return TResult::Ok(res);
+}
+
+/**
+ * \return serialized json value of the config.
+ */
+picojson::object DebugConfig::AsJSON() const {
+  picojson::object config;
+  config["ignore_eos"] = picojson::value(ignore_eos);
+  config["pinned_system_prompt"] = picojson::value(pinned_system_prompt);
+  switch (special_request) {
+    case SpecialRequestKind::kQueryEngineMetrics: {
+      config["special_request"] = picojson::value("query_engine_metrics");
+      break;
+    }
+    case SpecialRequestKind::kNone:
+      break;
+  }
+  switch (grammar_execution_mode) {
+    case GrammarExecutionMode::kJumpForward: {
+      config["grammar_execution_mode"] = picojson::value("jump_forward");
+      break;
+    }
+    case GrammarExecutionMode::kConstraint: {
+      config["grammar_execution_mode"] = picojson::value("constraint");
+      break;
+    }
+  }
+  return config;
+}
+
 /****************** GenerationConfig ******************/
 
 TVM_REGISTER_OBJECT_TYPE(GenerationConfigNode);
 
-GenerationConfig::GenerationConfig(String config_json_str, const GenerationConfig& default_config) {
-  picojson::object config = json::ParseToJSONObject(config_json_str);
-  ObjectPtr<GenerationConfigNode> n = make_object<GenerationConfigNode>();
+Result<GenerationConfig> GenerationConfig::Validate(GenerationConfig cfg) {
+  using TResult = Result<GenerationConfig>;
+  if (cfg->n <= 0) {
+    return TResult::Error("\"n\" should be at least 1");
+  }
+  if (cfg->temperature < 0) {
+    return TResult::Error("\"temperature\" should be non-negative");
+  }
+  if (cfg->top_p < 0 || cfg->top_p > 1) {
+    return TResult::Error("\"top_p\" should be in range [0, 1]");
+  }
+  if (std::fabs(cfg->frequency_penalty) > 2.0) {
+    return TResult::Error("frequency_penalty must be in [-2, 2]!");
+  }
+  if (cfg->repetition_penalty <= 0) {
+    return TResult::Error("\"repetition_penalty\" must be positive");
+  }
+  if (cfg->top_logprobs < 0 || cfg->top_logprobs > 5) {
+    return TResult::Error("At most 5 top logprob tokens are supported");
+  }
+  if (cfg->top_logprobs != 0 && !(cfg->logprobs)) {
+    return TResult::Error("\"logprobs\" must be true to support \"top_logprobs\"");
+  }
+  for (const auto& item : cfg->logit_bias) {
+    double bias_value = item.second;
+    if (std::fabs(bias_value) > 100.0) {
+      return TResult::Error("Logit bias value should be in range [-100, 100].");
+    }
+  }
+  return TResult::Ok(cfg);
+}
 
+Result<GenerationConfig> GenerationConfig::FromJSON(const picojson::object& config,
+                                                    const GenerationConfig& default_config) {
+  using TResult = Result<GenerationConfig>;
+  ObjectPtr<GenerationConfigNode> n = make_object<GenerationConfigNode>();
   n->n = json::LookupOrDefault<int64_t>(config, "n", default_config->n);
-  CHECK_GT(n->n, 0) << "\"n\" should be at least 1";
   n->temperature =
       json::LookupOrDefault<double>(config, "temperature", default_config->temperature);
-  CHECK_GE(n->temperature, 0) << "\"temperature\" should be non-negative";
   n->top_p = json::LookupOrDefault<double>(config, "top_p", default_config->top_p);
-  CHECK(n->top_p >= 0 && n->top_p <= 1) << "\"top_p\" should be in range [0, 1]";
   n->frequency_penalty =
       json::LookupOrDefault<double>(config, "frequency_penalty", default_config->frequency_penalty);
-  CHECK(std::fabs(n->frequency_penalty) <= 2.0) << "Frequency penalty must be in [-2, 2]!";
   n->presence_penalty =
       json::LookupOrDefault<double>(config, "presence_penalty", default_config->presence_penalty);
-  CHECK(std::fabs(n->presence_penalty) <= 2.0) << "Presence penalty must be in [-2, 2]!";
   n->repetition_penalty = json::LookupOrDefault<double>(config, "repetition_penalty",
                                                         default_config->repetition_penalty);
-  CHECK(n->repetition_penalty > 0) << "Repetition penalty must be a positive number!";
   n->logprobs = json::LookupOrDefault<bool>(config, "logprobs", default_config->logprobs);
   n->top_logprobs =
       json::LookupOrDefault<int64_t>(config, "top_logprobs", default_config->top_logprobs);
-  CHECK(n->top_logprobs >= 0 && n->top_logprobs <= 5)
-      << "At most 5 top logprob tokens are supported";
-  CHECK(n->top_logprobs == 0 || n->logprobs)
-      << "\"logprobs\" must be true to support \"top_logprobs\"";
 
   std::optional<picojson::object> logit_bias_obj =
       json::LookupOptional<picojson::object>(config, "logit_bias");
@@ -59,7 +179,6 @@ GenerationConfig::GenerationConfig(String config_json_str, const GenerationConfi
     for (auto [token_id_str, bias] : logit_bias_obj.value()) {
       CHECK(bias.is<double>());
       double bias_value = bias.get<double>();
-      CHECK_LE(std::fabs(bias_value), 100.0) << "Logit bias value should be in range [-100, 100].";
       logit_bias.emplace_back(std::stoi(token_id_str), bias_value);
     }
     n->logit_bias = std::move(logit_bias);
@@ -78,7 +197,9 @@ GenerationConfig::GenerationConfig(String config_json_str, const GenerationConfi
     Array<String> stop_strs;
     stop_strs.reserve(stop_strs_arr.value().size());
     for (const picojson::value& v : stop_strs_arr.value()) {
-      CHECK(v.is<std::string>()) << "Invalid stop string in stop_strs";
+      if (!v.is<std::string>()) {
+        return TResult::Error("Invalid stop string in stop_strs");
+      }
       stop_strs.push_back(v.get<std::string>());
     }
     n->stop_strs = std::move(stop_strs);
@@ -91,7 +212,9 @@ GenerationConfig::GenerationConfig(String config_json_str, const GenerationConfi
     std::vector<int> stop_token_ids;
     stop_token_ids.reserve(stop_token_ids_arr.value().size());
     for (const picojson::value& v : stop_token_ids_arr.value()) {
-      CHECK(v.is<int64_t>()) << "Invalid stop token in stop_token_ids";
+      if (!v.is<int64_t>()) {
+        return TResult::Error("Invalid stop token in stop_token_ids");
+      }
       stop_token_ids.push_back(v.get<int64_t>());
     }
     n->stop_token_ids = std::move(stop_token_ids);
@@ -102,34 +225,33 @@ GenerationConfig::GenerationConfig(String config_json_str, const GenerationConfi
   std::optional<picojson::object> response_format_obj =
       json::LookupOptional<picojson::object>(config, "response_format");
   if (response_format_obj.has_value()) {
-    ResponseFormat response_format;
-    response_format.type = json::LookupOrDefault<std::string>(response_format_obj.value(), "type",
-                                                              response_format.type);
-    std::optional<std::string> schema =
-        json::LookupOptional<std::string>(response_format_obj.value(), "schema");
-    if (schema.has_value()) {
-      response_format.schema = schema.value();
+    Result<ResponseFormat> response_format_res =
+        ResponseFormat::FromJSON(response_format_obj.value());
+    if (response_format_res.IsErr()) {
+      return TResult::Error(response_format_res.UnwrapErr());
     }
-    n->response_format = response_format;
+    n->response_format = response_format_res.Unwrap();
   } else {
     n->response_format = default_config->response_format;
   }
   // "debug_config" is for internal usage. Not the part of OpenAI API spec.
   std::optional<picojson::object> debug_config_obj =
       json::LookupOptional<picojson::object>(config, "debug_config");
-  if (debug_config_obj.has_value()) {
-    n->debug_config.pinned_system_prompt =
-        json::LookupOrDefault<bool>(debug_config_obj.value(), "pinned_system_prompt", false);
-    n->debug_config.ignore_eos =
-        json::LookupOrDefault<bool>(debug_config_obj.value(), "ignore_eos", false);
-  }
 
-  data_ = std::move(n);
+  if (debug_config_obj.has_value()) {
+    Result<DebugConfig> debug_config_res = DebugConfig::FromJSON(debug_config_obj.value());
+    if (debug_config_res.IsErr()) {
+      return TResult::Error(debug_config_res.UnwrapErr());
+    }
+    n->debug_config = debug_config_res.Unwrap();
+  }
+  return Validate(GenerationConfig(n));
 }
 
 GenerationConfig GenerationConfig::GetDefaultFromModelConfig(
     const picojson::object& model_config_json) {
   ObjectPtr<GenerationConfigNode> n = make_object<GenerationConfigNode>();
+  n->max_tokens = -1;
   n->temperature = json::LookupOrDefault<double>(model_config_json, "temperature", n->temperature);
   n->top_p = json::LookupOrDefault<double>(model_config_json, "top_p", n->top_p);
   n->frequency_penalty =
@@ -139,7 +261,7 @@ GenerationConfig GenerationConfig::GetDefaultFromModelConfig(
   return GenerationConfig(n);
 }
 
-String GenerationConfigNode::AsJSONString() const {
+picojson::object GenerationConfigNode::AsJSON() const {
   picojson::object config;
   config["n"] = picojson::value(static_cast<int64_t>(this->n));
   config["temperature"] = picojson::value(this->temperature);
@@ -176,17 +298,8 @@ String GenerationConfigNode::AsJSONString() const {
                                   ? picojson::value(this->response_format.schema.value())
                                   : picojson::value();
   config["response_format"] = picojson::value(response_format);
-
-  // Params for internal usage. Not the part of OpenAI API spec.
-  {
-    picojson::object debug_config_obj;
-    debug_config_obj["pinned_system_prompt"] =
-        picojson::value(this->debug_config.pinned_system_prompt);
-    debug_config_obj["ignore_eos"] = picojson::value(this->debug_config.ignore_eos);
-    config["debug_config"] = picojson::value(debug_config_obj);
-  }
-
-  return picojson::value(config).serialize(true);
+  config["debug_config"] = picojson::value(debug_config.AsJSON());
+  return config;
 }
 
 /****************** EngineConfig ******************/
@@ -197,7 +310,6 @@ EngineConfig EngineConfig::FromJSONAndInferredConfig(
     const picojson::object& json, const InferrableEngineConfig& inferred_config) {
   CHECK(inferred_config.max_num_sequence.has_value());
   CHECK(inferred_config.max_total_sequence_length.has_value());
-  CHECK(inferred_config.max_single_sequence_length.has_value());
   CHECK(inferred_config.prefill_chunk_size.has_value());
   CHECK(inferred_config.max_history_size.has_value());
   ObjectPtr<EngineConfigNode> n = make_object<EngineConfigNode>();
@@ -230,12 +342,16 @@ EngineConfig EngineConfig::FromJSONAndInferredConfig(
       json, "speculative_mode", SpeculativeModeToString(n->speculative_mode)));
   n->spec_draft_length =
       json::LookupOrDefault<int64_t>(json, "spec_draft_length", n->spec_draft_length);
+  n->prefill_mode = PrefillModeFromString(json::LookupOrDefault<std::string>(
+      json, "prefill_mode", PrefillModeToString(n->prefill_mode)));
   n->verbose = json::LookupOrDefault<bool>(json, "verbose", n->verbose);
 
   // - Fields from the inferred engine config.
   n->max_num_sequence = inferred_config.max_num_sequence.value();
   n->max_total_sequence_length = inferred_config.max_total_sequence_length.value();
-  n->max_single_sequence_length = inferred_config.max_single_sequence_length.value();
+  if (inferred_config.max_single_sequence_length.has_value()) {
+    n->max_single_sequence_length = inferred_config.max_single_sequence_length.value();
+  }
   n->prefill_chunk_size = inferred_config.prefill_chunk_size.value();
   n->max_history_size = inferred_config.max_history_size.value();
 
@@ -306,6 +422,7 @@ String EngineConfigNode::AsJSONString() const {
       picojson::value(static_cast<int64_t>(this->prefix_cache_max_num_recycling_seqs));
   config["speculative_mode"] = picojson::value(SpeculativeModeToString(this->speculative_mode));
   config["spec_draft_length"] = picojson::value(static_cast<int64_t>(this->spec_draft_length));
+  config["prefill_mode"] = picojson::value(PrefillModeToString(this->prefill_mode));
   config["verbose"] = picojson::value(static_cast<bool>(this->verbose));
 
   return picojson::value(config).serialize(true);
@@ -315,19 +432,19 @@ String EngineConfigNode::AsJSONString() const {
 
 /*! \brief The class for config limitation from models. */
 struct ModelConfigLimits {
-  int64_t model_max_single_sequence_length;
-  int64_t model_max_prefill_chunk_size;
+  int64_t model_compile_time_max_single_sequence_length;
+  int64_t model_runtime_max_single_sequence_length;
+  int64_t model_compile_time_max_prefill_chunk_size;
+  int64_t model_runtime_max_prefill_chunk_size;
   int64_t model_max_sliding_window_size;
   int64_t model_max_batch_size;
 };
 
 /*! \brief Convert the bytes to megabytes, keeping 3 decimals. */
 inline std::string BytesToMegabytesString(double bytes) {
-  std::string str;
-  str.resize(20);
-  std::sprintf(&str[0], "%.3f", bytes / 1024 / 1024);
-  str.resize(std::strlen(str.c_str()));
-  return str;
+  std::ostringstream os;
+  os << std::setprecision(3) << std::fixed << (bytes / 1024 / 1024);
+  return os.str();
 }
 
 /*!
@@ -337,8 +454,10 @@ inline std::string BytesToMegabytesString(double bytes) {
 Result<ModelConfigLimits> GetModelConfigLimits(const std::vector<picojson::object>& model_configs,
                                                const std::vector<ModelMetadata>& model_metadata) {
   ICHECK_EQ(model_configs.size(), model_metadata.size());
-  int64_t model_max_single_sequence_length = std::numeric_limits<int64_t>::max();
-  int64_t model_max_prefill_chunk_size = std::numeric_limits<int64_t>::max();
+  int64_t model_compile_time_max_single_sequence_length = std::numeric_limits<int64_t>::max();
+  int64_t model_runtime_max_single_sequence_length = std::numeric_limits<int64_t>::max();
+  int64_t model_compile_time_max_prefill_chunk_size = std::numeric_limits<int64_t>::max();
+  int64_t model_runtime_max_prefill_chunk_size = std::numeric_limits<int64_t>::max();
   int64_t model_max_batch_size = std::numeric_limits<int64_t>::max();
   int64_t model_max_sliding_window_size = std::numeric_limits<int64_t>::max();
   for (int i = 0; i < static_cast<int>(model_configs.size()); ++i) {
@@ -355,9 +474,13 @@ Result<ModelConfigLimits> GetModelConfigLimits(const std::vector<picojson::objec
       }
     }
 
+    if (compile_time_context_window_size != -1) {
+      model_compile_time_max_single_sequence_length =
+          std::min(model_compile_time_max_single_sequence_length, compile_time_context_window_size);
+    }
     if (runtime_context_window_size != -1) {
-      model_max_single_sequence_length =
-          std::min(model_max_single_sequence_length, runtime_context_window_size);
+      model_runtime_max_single_sequence_length =
+          std::min(model_runtime_max_single_sequence_length, runtime_context_window_size);
     }
     // - The maximum prefill chunk size is the minimum prefill chunk size among all models.
     int64_t runtime_prefill_chunk_size =
@@ -372,16 +495,16 @@ Result<ModelConfigLimits> GetModelConfigLimits(const std::vector<picojson::objec
       }
     }
 
+    if (compile_time_prefill_chunk_size != -1) {
+      model_compile_time_max_prefill_chunk_size =
+          std::min(model_compile_time_max_prefill_chunk_size, compile_time_prefill_chunk_size);
+    }
     if (runtime_prefill_chunk_size != -1) {
-      model_max_prefill_chunk_size =
-          std::min(model_max_prefill_chunk_size, runtime_prefill_chunk_size);
+      model_runtime_max_prefill_chunk_size =
+          std::min(model_runtime_max_prefill_chunk_size, runtime_prefill_chunk_size);
     }
     // - The maximum batch size is the minimum max batch size among all models.
-    model_max_batch_size = std::min(
-        model_max_batch_size,
-        json::LookupOptional<int64_t>(
-            json::Lookup<picojson::object>(model_configs[i], "model_config"), "max_batch_size")
-            .value_or(128));
+    model_max_batch_size = std::min(model_max_batch_size, model_metadata[i].max_batch_size);
     // - The maximum sliding window size is the minimum among all models.
     int64_t runtime_sliding_window_size =
         json::LookupOptional<int64_t>(model_configs[i], "sliding_window_size").value_or(-1);
@@ -390,13 +513,16 @@ Result<ModelConfigLimits> GetModelConfigLimits(const std::vector<picojson::objec
           std::min(model_max_sliding_window_size, runtime_sliding_window_size);
     }
   }
-  ICHECK_NE(model_max_prefill_chunk_size, std::numeric_limits<int64_t>::max());
+  ICHECK_NE(model_compile_time_max_prefill_chunk_size, std::numeric_limits<int64_t>::max());
+  ICHECK_NE(model_runtime_max_prefill_chunk_size, std::numeric_limits<int64_t>::max());
   ICHECK_NE(model_max_batch_size, std::numeric_limits<int64_t>::max());
-  ICHECK_GT(model_max_prefill_chunk_size, 0);
+  ICHECK_GT(model_compile_time_max_prefill_chunk_size, 0);
+  ICHECK_GT(model_runtime_max_prefill_chunk_size, 0);
   ICHECK_GT(model_max_batch_size, 0);
-  return Result<ModelConfigLimits>::Ok({model_max_single_sequence_length,
-                                        model_max_prefill_chunk_size, model_max_sliding_window_size,
-                                        model_max_batch_size});
+  return Result<ModelConfigLimits>::Ok(
+      {model_compile_time_max_single_sequence_length, model_runtime_max_single_sequence_length,
+       model_compile_time_max_prefill_chunk_size, model_runtime_max_prefill_chunk_size,
+       model_max_sliding_window_size, model_max_batch_size});
 }
 
 /*! \brief The class for memory usage estimation result. */
@@ -435,11 +561,11 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
   // - 2. max_single_sequence_length
   if (!init_config.max_single_sequence_length.has_value()) {
     inferred_config.max_single_sequence_length =
-        model_config_limits.model_max_single_sequence_length;
+        model_config_limits.model_runtime_max_single_sequence_length;
   } else {
     inferred_config.max_single_sequence_length =
         std::min(inferred_config.max_single_sequence_length.value(),
-                 model_config_limits.model_max_single_sequence_length);
+                 model_config_limits.model_compile_time_max_single_sequence_length);
   }
   // - 3. infer the maximum total sequence length that can fit GPU memory.
   double kv_bytes_per_token = 0;
@@ -461,7 +587,9 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
     int64_t num_qo_heads = model_metadata[i].kv_cache_metadata.num_attention_heads;
     int64_t num_kv_heads = model_metadata[i].kv_cache_metadata.num_key_value_heads;
     int64_t hidden_size = head_dim * num_qo_heads;
-    kv_bytes_per_token += head_dim * num_kv_heads * num_layers * 4 + 1.25;
+    kv_bytes_per_token +=
+        head_dim * num_kv_heads * (num_layers / model_metadata[i].pipeline_parallel_stages) * 4 +
+        1.25;
     kv_aux_workspace_bytes +=
         (max_num_sequence + 1) * 88 + prefill_chunk_size * (num_qo_heads + 1) * 8 +
         prefill_chunk_size * head_dim * (num_qo_heads + num_kv_heads) * 4 + 48 * 1024 * 1024;
@@ -470,10 +598,7 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
     logit_processor_workspace_bytes +=
         max_num_sequence * 20 + max_num_sequence * vocab_size * 16.125;
   }
-  // Get single-card GPU size.
-  TVMRetValue rv;
-  DeviceAPI::Get(device)->GetAttr(device, DeviceAttrKind::kTotalGlobalMemory, &rv);
-  int64_t gpu_size_bytes = rv;
+  int64_t gpu_size_bytes = TotalDetectGlobalMemory(device);
   // Compute the maximum total sequence length under the GPU memory budget.
   int64_t model_max_total_sequence_length =
       static_cast<int>((gpu_size_bytes * gpu_memory_utilization  //
@@ -522,16 +647,18 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
   if (!init_config.max_total_sequence_length.has_value()) {
     if (mode == EngineMode::kLocal) {
       inferred_config.max_total_sequence_length = std::min(
-          {model_max_total_sequence_length, model_config_limits.model_max_single_sequence_length,
+          {model_max_total_sequence_length, inferred_config.max_single_sequence_length.value(),
            static_cast<int64_t>(8192)});
     } else if (mode == EngineMode::kInteractive) {
       inferred_config.max_total_sequence_length = std::min(
-          {model_max_total_sequence_length, model_config_limits.model_max_single_sequence_length,
+          {model_max_total_sequence_length, inferred_config.max_single_sequence_length.value(),
            model_config_limits.model_max_sliding_window_size});
     } else {
       inferred_config.max_total_sequence_length =
-          std::min(model_max_total_sequence_length,
-                   max_num_sequence * model_config_limits.model_max_single_sequence_length);
+          inferred_config.max_single_sequence_length.value() == std::numeric_limits<int64_t>::max()
+              ? model_max_total_sequence_length
+              : std::min(model_max_total_sequence_length,
+                         max_num_sequence * inferred_config.max_single_sequence_length.value());
     }
     os << "max KV cache token capacity will be set to "
        << inferred_config.max_total_sequence_length.value() << ", ";
@@ -543,11 +670,11 @@ Result<MemUsageEstimationResult> EstimateMemoryUsageOnMode(
   if (!init_config.prefill_chunk_size.has_value()) {
     if (mode == EngineMode::kLocal || mode == EngineMode::kInteractive) {
       inferred_config.prefill_chunk_size =
-          std::min({model_config_limits.model_max_prefill_chunk_size,
+          std::min({model_config_limits.model_runtime_max_prefill_chunk_size,
                     inferred_config.max_total_sequence_length.value(),
-                    model_config_limits.model_max_single_sequence_length});
+                    inferred_config.max_single_sequence_length.value()});
     } else {
-      inferred_config.prefill_chunk_size = model_config_limits.model_max_prefill_chunk_size;
+      inferred_config.prefill_chunk_size = model_config_limits.model_runtime_max_prefill_chunk_size;
     }
     os << "prefill chunk size will be set to " << inferred_config.prefill_chunk_size.value()
        << ". ";
@@ -681,8 +808,8 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForRNNState(
   InferrableEngineConfig inferred_config = init_config;
   // - 1. prefill_chunk_size
   if (!init_config.prefill_chunk_size.has_value()) {
-    inferred_config.prefill_chunk_size =
-        std::min(model_config_limits.model_max_prefill_chunk_size, static_cast<int64_t>(4096));
+    inferred_config.prefill_chunk_size = std::min(
+        model_config_limits.model_runtime_max_prefill_chunk_size, static_cast<int64_t>(4096));
     os << "prefill chunk size will be set to " << inferred_config.prefill_chunk_size.value()
        << ", ";
   } else {
@@ -765,10 +892,7 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForRNNState(
     logit_processor_workspace_bytes +=
         max_num_sequence * 20 + max_num_sequence * vocab_size * 16.125;
   }
-  // Get single-card GPU size.
-  TVMRetValue rv;
-  DeviceAPI::Get(device)->GetAttr(device, DeviceAttrKind::kTotalGlobalMemory, &rv);
-  int64_t gpu_size_bytes = rv;
+  int64_t gpu_size_bytes = TotalDetectGlobalMemory(device);
   // Compute the maximum history size length under the GPU memory budget.
   int64_t model_max_history_size = static_cast<int>((gpu_size_bytes * gpu_memory_utilization  //
                                                      - params_bytes                           //

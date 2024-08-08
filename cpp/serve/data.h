@@ -11,7 +11,10 @@
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/object.h>
 
-#include "../tokenizers.h"
+#include <atomic>
+#include <optional>
+
+#include "../tokenizers/tokenizers.h"
 
 namespace mlc {
 namespace llm {
@@ -138,6 +141,9 @@ struct SampleResult {
   /*! \brief The token id and probability of the tokens with top probabilities. */
   std::vector<TokenProbPair> top_prob_tokens;
 
+  /*! \brief Get the sampled token id. */
+  int32_t GetTokenId() const;
+
   /*!
    * \brief Get the logprob JSON string of this token with regard
    * to OpenAI API at https://platform.openai.com/docs/api-reference/chat/object.
@@ -153,6 +159,11 @@ struct SampleResult {
 /*!
  * \brief The generated delta request output that is streamed back
  * through callback stream function.
+ *
+ * \note: This output object corresponds to parallel generated outputs when n != 1.
+ *
+ * For example, if n=2, then group_delta_token_ids[0] matches to the output stream 0
+ * and group_delta_token_ids[1] matches to the output stream 1
  */
 class RequestStreamOutputObj : public Object {
  public:
@@ -162,14 +173,25 @@ class RequestStreamOutputObj : public Object {
    * \brief The new generated token ids since the last callback invocation
    * for the input request.
    */
-  Array<IntTuple> group_delta_token_ids;
+  std::vector<std::vector<int64_t>> group_delta_token_ids;
   /*! \brief The logprobs JSON strings of the new generated tokens since last invocation. */
-  Optional<Array<Array<String>>> group_delta_logprob_json_strs;
+  std::optional<std::vector<std::vector<String>>> group_delta_logprob_json_strs;
   /*!
    * \brief The finish reason of the request when it is finished,
    * of None if the request has not finished yet.
    */
-  Array<Optional<String>> group_finish_reason;
+  std::vector<Optional<String>> group_finish_reason;
+  /*!
+   * \brief The usage field of the response, this is global to all streams.
+   */
+  Optional<String> request_final_usage_json_str;
+
+  /*!
+   * \brief The extra prefix string of all requests.
+   */
+  std::vector<String> group_extra_prefix_string;
+
+  std::atomic<bool> unpacked = false;
 
   static constexpr const char* _type_key = "mlc.serve.RequestStreamOutput";
   static constexpr const bool _type_has_method_sequal_reduce = false;
@@ -183,11 +205,15 @@ class RequestStreamOutputObj : public Object {
  */
 class RequestStreamOutput : public ObjectRef {
  public:
-  explicit RequestStreamOutput(String request_id, Array<IntTuple> group_delta_token_ids,
-                               Optional<Array<Array<String>>> group_delta_logprob_json_strs,
-                               Array<Optional<String>> finish_reason);
+  explicit RequestStreamOutput(
+      String request_id, std::vector<std::vector<int64_t>> group_delta_token_ids,
+      std::optional<std::vector<std::vector<String>>> group_delta_logprob_json_strs,
+      std::vector<Optional<String>> group_finish_reason,
+      std::vector<String> group_extra_prefix_string);
 
-  TVM_DEFINE_OBJECT_REF_METHODS(RequestStreamOutput, ObjectRef, RequestStreamOutputObj);
+  static RequestStreamOutput Usage(String request_id, String request_final_usage_json_str);
+
+  TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestStreamOutput, ObjectRef, RequestStreamOutputObj);
 };
 
 }  // namespace serve

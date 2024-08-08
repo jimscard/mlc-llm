@@ -1,5 +1,7 @@
-from mlc_llm.serve import DebugConfig, GenerationConfig
+from mlc_llm.protocol.debug_protocol import DebugConfig
+from mlc_llm.protocol.generation_config import GenerationConfig
 from mlc_llm.serve.sync_engine import EngineConfig, SyncMLCEngine
+from mlc_llm.testing import require_test_model
 
 prompts = [
     "The meaning of life is",
@@ -28,7 +30,7 @@ def test_engine_system_prompt(engine):
         ),
     )
     metrics = engine.metrics()
-    assert metrics["num_prefill_tokens_sum"] == system_prompt_tokens
+    assert metrics["prefill_tokens_sum"] == system_prompt_tokens
     sum_prefill_tokens = system_prompt_tokens
 
     input_token_lens = [len(engine.tokenizer.encode(prompt)) for prompt in prompts]
@@ -36,19 +38,19 @@ def test_engine_system_prompt(engine):
     generation_config = GenerationConfig(temperature=0, max_tokens=max_tokens)
     _, _ = engine.generate(prompts, generation_config)
     metrics = engine.metrics()
-    assert metrics["num_prefill_tokens_sum"] == sum_prefill_tokens + sum(input_token_lens)
-    sum_prefill_tokens = metrics["num_prefill_tokens_sum"]
+    assert metrics["prefill_tokens_sum"] == sum_prefill_tokens + sum(input_token_lens)
+    sum_prefill_tokens = metrics["prefill_tokens_sum"]
 
     _, _ = engine.generate(system_prompt + " and why ?", generation_config)
     metrics = engine.metrics()
     # system prompt is reused entirely
-    assert metrics["num_prefill_tokens_sum"] == sum_prefill_tokens + 3
-    sum_prefill_tokens = metrics["num_prefill_tokens_sum"]
+    assert metrics["prefill_tokens_sum"] == sum_prefill_tokens + 3
+    sum_prefill_tokens = metrics["prefill_tokens_sum"]
 
     _, _ = engine.generate(prompts[:4], generation_config)
     metrics = engine.metrics()
     # first 4 prompts are removed and need to prefill again
-    assert metrics["num_prefill_tokens_sum"] == sum_prefill_tokens + sum(input_token_lens[:4])
+    assert metrics["prefill_tokens_sum"] == sum_prefill_tokens + sum(input_token_lens[:4])
 
 
 def test_engine_multi_round(engine):
@@ -59,19 +61,19 @@ def test_engine_multi_round(engine):
 
     output_texts, _ = engine.generate(prompts[:num_requests], generation_config)
     metrics = engine.metrics()
-    assert metrics["num_prefill_tokens_sum"] == sum(input_token_lens)
-    sum_prefill_tokens = metrics["num_prefill_tokens_sum"]
+    assert metrics["prefill_tokens_sum"] == sum(input_token_lens)
+    sum_prefill_tokens = metrics["prefill_tokens_sum"]
     concat_prompt = []
     for i, output in enumerate(output_texts):
         concat_prompt.append(prompts[i] + " " + output[0] + " ?")
     output_texts, _ = engine.generate(concat_prompt[:num_requests], generation_config)
     metrics = engine.metrics()
-    assert metrics["num_prefill_tokens_sum"] == sum_prefill_tokens + 2 * num_requests
+    assert metrics["prefill_tokens_sum"] == sum_prefill_tokens + 2 * num_requests
 
 
-def test_basic_engine_system_prompt():
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_basic_engine_system_prompt(model: str):
     # Create engine
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC"
     engine = SyncMLCEngine(
         model=model,
         mode="local",
@@ -83,9 +85,9 @@ def test_basic_engine_system_prompt():
     test_engine_system_prompt(engine)
 
 
-def test_basic_engine_multi_round():
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_basic_engine_multi_round(model: str):
     # Create engine
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC"
     engine = SyncMLCEngine(
         model=model,
         mode="server",
@@ -94,11 +96,12 @@ def test_basic_engine_multi_round():
     test_engine_multi_round(engine)
 
 
-def test_engine_spec_multi_round():
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+def test_engine_spec_multi_round(model: str, small_model: str):
     # Create engine
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC"
-    small_model = "HF://mlc-ai/Llama-2-7b-chat-hf-q4f16_1-MLC"
-
     engine = SyncMLCEngine(
         model=model,
         mode="server",
@@ -112,9 +115,9 @@ def test_engine_spec_multi_round():
     test_engine_multi_round(engine)
 
 
-def test_engine_eagle_multi_round():
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_engine_eagle_multi_round(model: str):
     # Create engine
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC"
     small_model = "dist/Eagle-llama2-7b-chat-q0f16-MLC"
     small_model_lib = "dist/Eagle-llama2-7b-chat-q0f16-MLC/Eagle-llama2-7b-chat-q0f16-MLC-cuda.so"
     engine = SyncMLCEngine(

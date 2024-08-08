@@ -46,6 +46,12 @@ struct EngineInternalIDManager {
   }
 };
 
+/*! \brief The data structures used in the action post-process. */
+struct ActionPostProcessWorkspace {
+  std::vector<RequestStateEntry> finished_rsentries;
+  Array<RequestStreamOutput> callback_delta_outputs;
+};
+
 /*!
  * \brief The state of the running engine.
  * It contains the requests and their states submitted to the Engine.
@@ -64,16 +70,28 @@ class EngineStateObj : public Object {
   EngineMetrics metrics;
   /*! \brief The prefix cache. */
   PrefixCache prefix_cache{nullptr};
+  /*! \brief A boolean flag denoting whether the running request state entry list has changed. */
+  bool running_rsentries_changed = true;
+  /*!
+   * \brief The post-process data structures.
+   * We make it a workspace to avoid repetitive memory allocation/free in the action post process.
+   */
+  ActionPostProcessWorkspace postproc_workspace;
 
   /*! \brief Reset the engine state and clear the metrics. */
   void Reset();
   /*! \brief Get the request state of the given request. */
   RequestState GetRequestState(Request request);
+  /*! \brief Return the running request state entries*/
+  const std::vector<RequestStateEntry>& GetRunningRequestStateEntries();
 
   static constexpr const char* _type_key = "mlc.serve.EngineState";
   static constexpr const bool _type_has_method_sequal_reduce = false;
   static constexpr const bool _type_has_method_shash_reduce = false;
   TVM_DECLARE_FINAL_OBJECT_INFO(EngineStateObj, Object);
+
+ private:
+  std::vector<RequestStateEntry> cached_running_rsentries_;
 };
 
 /*!

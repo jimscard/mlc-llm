@@ -54,7 +54,7 @@ class QWenConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     break
             else:
                 raise ValueError(
-                    "Unable to determine the maxmimum sequence length, because none of "
+                    "Unable to determine the maximum sequence length, because none of "
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
@@ -84,6 +84,11 @@ class QWenConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
 class QWenAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
     def __init__(self, config: QWenConfig):
         self.hidden_size = config.hidden_size
+        if config.num_attention_heads % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split {config.num_attention_heads} attention heads "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.num_heads = config.num_attention_heads // config.tensor_parallel_shards
         self.head_dim = config.head_dim
 
@@ -110,6 +115,11 @@ class QWenAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
 
 class QWenMLP(nn.Module):
     def __init__(self, config: QWenConfig):
+        if config.intermediate_size % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split MLP intermediate size {config.intermediate_size} "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
         self.gate_up_proj = nn.Linear(
             in_features=config.hidden_size,

@@ -133,7 +133,7 @@ It is recommended to have at least 6GB free VRAM to run it.
 
     |
 
-    **Requirement**. Llama3-8B model needs an iOS device with a minimum of 6GB RAM, whereas the RedPajama-3B model runs with at least 4GB RAM.
+    **Note**. The larger model might take more VRAM, try start with smaller models first.
 
     **Tutorial and source code**. The source code of the iOS app is fully `open source <https://github.com/mlc-ai/mlc-llm/tree/main/ios>`__,
     and a :ref:`tutorial <deploy-ios>` is included in documentation.
@@ -154,7 +154,7 @@ It is recommended to have at least 6GB free VRAM to run it.
 
     |
 
-    **Requirement**. Llama3-8B model needs a device with a minimum of 6GB RAM, whereas the RedPajama-3B model runs with at least 4GB RAM.
+    **Note**. The larger model might take more VRAM, try start with smaller models first.
     The demo is tested on
 
     - Samsung S23 with Snapdragon 8 Gen 2 chip
@@ -185,6 +185,6 @@ What to Do Next
   - :ref:`deploy-android`
   - :ref:`deploy-ide-integration`
 
-- `Convert model weight to MLC format <convert-weights-via-MLC>`_, if you want to run your own models.
-- `Compile model libraries <compile-model-libraries>`_, if you want to deploy to web/iOS/Android or control the model optimizations.
+- :ref:`convert-weights-via-MLC`, if you want to run your own models.
+- :ref:`compile-model-libraries`, if you want to deploy to web/iOS/Android or control the model optimizations.
 - Report any problem or ask any question: open new issues in our `GitHub repo <https://github.com/mlc-ai/mlc-llm/issues>`_.

@@ -27,9 +27,10 @@ class ModelImpl;
 TVM_REGISTER_OBJECT_TYPE(ModelObj);
 
 Model Model::Create(String reload_lib_path, String model_path, const picojson::object& model_config,
-                    DLDevice device, const Optional<Session>& session, bool trace_enabled) {
+                    DLDevice device, const Optional<Session>& session, int num_shards,
+                    int num_stages, bool trace_enabled) {
   return Model(make_object<ModelImpl>(reload_lib_path, model_path, model_config, device, session,
-                                      trace_enabled));
+                                      num_shards, num_stages, trace_enabled));
 }
 
 Result<picojson::object> Model::LoadModelConfig(const String& model_path) {
@@ -56,14 +57,17 @@ class ModelImpl : public ModelObj {
    * \sa Model::Create
    */
   explicit ModelImpl(String reload_lib_path, String model_path, picojson::object model_config,
-                     DLDevice device, const Optional<Session>& session, bool trace_enabled)
+                     DLDevice device, const Optional<Session>& session, int num_shards,
+                     int num_stages, bool trace_enabled)
       : model_(model_path), device_(device) {
     // Step 1. Process model config json string.
     LoadModelConfigJSON(model_config);
     // Step 2. Initialize vm, we use the packed function mechanism
     // so there is no explicit abi dependency on these extra
     // classes other than basic tvm runtime.
-    this->ft_.Init(reload_lib_path, device_, model_config, session);
+    this->ft_.Init(reload_lib_path, device_, model_config, session, num_shards, num_stages);
+    this->num_shards_ = ft_.model_metadata_.tensor_parallel_shards;
+    this->num_stages_ = ft_.model_metadata_.pipeline_parallel_stages;
     // Step 3. Reset
     this->Reset();
     // Step 4. Set model type
@@ -89,7 +93,11 @@ class ModelImpl : public ModelObj {
     ICHECK_EQ(token_ids_nd->ndim, 1);
     ICHECK_EQ(token_ids_nd->shape[0], num_tokens);
     ICHECK_NE(prefill_chunk_size_, -1);
-    auto token_ids_dref_or_nd = ft_.CopyToWorker0(token_ids_nd, "token_ids", {prefill_chunk_size_});
+    ObjectRef token_ids_dref_or_nd;
+    {
+      NVTXScopedRange nvtx_scope("Copy to worker 0");
+      token_ids_dref_or_nd = ft_.CopyToWorker0(token_ids_nd, "token_ids", {prefill_chunk_size_});
+    }
 
     ObjectRef embeddings = ft_.embed_func_(token_ids_dref_or_nd, params_);
     if (dst != nullptr) {
@@ -204,7 +212,6 @@ class ModelImpl : public ModelObj {
 
   NDArray BatchPrefill(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
                        const std::vector<int>& lengths) final {
-    NVTXScopedRange nvtx_scope("BatchPrefill");
     CHECK(!seq_ids.empty());
     CHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -215,6 +222,8 @@ class ModelImpl : public ModelObj {
       total_length += lengths[i];
       p_logit_pos[i] = total_length - 1;
     }
+    NVTXScopedRange nvtx_scope("BatchPrefill num_seq=" + std::to_string(num_sequences) +
+                               " total_len=" + std::to_string(total_length));
     NDArray logit_pos_nd = logit_pos_arr_.CreateView({num_sequences}, DataType::Int(32));
 
     CHECK(ft_.prefill_func_.defined())
@@ -257,8 +266,14 @@ class ModelImpl : public ModelObj {
     }
     NDArray logits;
     if (ft_.use_disco) {
-      Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0);
-      logits = Downcast<NDArray>(result[0]);
+      ret = ft_.tuple_getitem_func_(ret, 0);
+      if (num_stages_ > 1) {
+        // Send the result from the last worker group to worker 0.
+        ShapeTuple shape{1, num_sequences, vocab_size_};
+        DataType dtype = DataType::Float(32);
+        ret = ft_.last_group_send_to_worker_0_(ret, disco_logits_arr_, shape, dtype);
+      }
+      logits = Downcast<DRef>(ret)->DebugGetFromRemote(0);
     } else {
       logits = Downcast<Array<NDArray>>(ret)[0];
     }
@@ -383,8 +398,14 @@ class ModelImpl : public ModelObj {
     }
     NDArray logits;
     if (ft_.use_disco) {
-      Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0);
-      logits = Downcast<NDArray>(result[0]);
+      ret = ft_.tuple_getitem_func_(ret, 0);
+      if (num_stages_ > 1) {
+        // Send the result from the last worker group to worker 0.
+        ShapeTuple shape{num_sequence, 1, vocab_size_};
+        DataType dtype = DataType::Float(32);
+        ret = ft_.last_group_send_to_worker_0_(ret, disco_logits_arr_, shape, dtype);
+      }
+      logits = Downcast<DRef>(ret)->DebugGetFromRemote(0);
     } else {
       logits = Downcast<Array<NDArray>>(ret)[0];
     }
@@ -450,7 +471,8 @@ class ModelImpl : public ModelObj {
   }
 
   NDArray BatchVerify(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
-                      const std::vector<int>& lengths) final {
+                      const std::vector<int>& lengths,
+                      const std::vector<int64_t>& token_tree_parent_ptr) final {
     CHECK(!seq_ids.empty());
     CHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -458,6 +480,7 @@ class ModelImpl : public ModelObj {
     for (int i = 0; i < num_sequences; ++i) {
       total_length += lengths[i];
     }
+    CHECK_EQ(total_length, token_tree_parent_ptr.size());
 
     NVTXScopedRange nvtx_scope("BatchVerify num_tokens=" + std::to_string(total_length));
 
@@ -471,7 +494,9 @@ class ModelImpl : public ModelObj {
     // Begin forward with the sequence ids and new lengths.
     IntTuple seq_ids_tuple(seq_ids);
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
-    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
+    IntTuple token_tree_parent_ptr_tuple(token_tree_parent_ptr);
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
+                                     token_tree_parent_ptr_tuple);
 
     ObjectRef embeddings_dref_or_nd;
     if (!embeddings->IsInstance<DRefObj>()) {
@@ -493,8 +518,14 @@ class ModelImpl : public ModelObj {
     ObjectRef ret = ft_.verify_func_(embeddings_dref_or_nd, kv_cache_, params_);
     NDArray logits;
     if (ft_.use_disco) {
-      Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0);
-      logits = Downcast<NDArray>(result[0]);
+      ret = ft_.tuple_getitem_func_(ret, 0);
+      if (num_stages_ > 1) {
+        // Send the result from the last worker group to worker 0.
+        ShapeTuple shape{1, total_length, vocab_size_};
+        DataType dtype = DataType::Float(32);
+        ret = ft_.last_group_send_to_worker_0_(ret, disco_logits_arr_, shape, dtype);
+      }
+      logits = Downcast<DRef>(ret)->DebugGetFromRemote(0);
     } else {
       logits = Downcast<Array<NDArray>>(ret)[0];
     }
@@ -512,7 +543,8 @@ class ModelImpl : public ModelObj {
 
   ObjectRef BatchVerifyToLastHidden(const ObjectRef& embeddings,
                                     const std::vector<int64_t>& seq_ids,
-                                    const std::vector<int>& lengths) final {
+                                    const std::vector<int>& lengths,
+                                    const std::vector<int64_t>& token_tree_parent_ptr) final {
     CHECK(!seq_ids.empty());
     CHECK_EQ(seq_ids.size(), lengths.size());
     int num_sequences = seq_ids.size();
@@ -520,6 +552,7 @@ class ModelImpl : public ModelObj {
     for (int i = 0; i < num_sequences; ++i) {
       total_length += lengths[i];
     }
+    CHECK_EQ(total_length, token_tree_parent_ptr.size());
     NVTXScopedRange nvtx_scope("BatchVerifyToLastHidden num_tokens=" +
                                std::to_string(total_length));
 
@@ -548,7 +581,9 @@ class ModelImpl : public ModelObj {
     // Begin forward with the sequence ids and new lengths.
     IntTuple seq_ids_tuple(seq_ids);
     IntTuple lengths_tuple(lengths.begin(), lengths.end());
-    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple);
+    IntTuple token_tree_parent_ptr_tuple(token_tree_parent_ptr);
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
+                                     token_tree_parent_ptr_tuple);
 
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef result = ft_.verify_to_last_hidden_func_(embeddings_dref_or_nd, kv_cache_, params_);
@@ -575,7 +610,6 @@ class ModelImpl : public ModelObj {
 
   void CreateKVCache(int page_size, int max_num_sequence, int64_t max_total_sequence_length,
                      int64_t prefill_chunk_size, int max_history_size) final {
-    //  KVStateKind kv_state_kind) final {
     KVStateKind kv_state_kind = GetMetadata().kv_state_kind;
     if (kv_state_kind == KVStateKind::kKVCache) {
       IntTuple max_num_sequence_tuple{max_num_sequence};
@@ -629,6 +663,15 @@ class ModelImpl : public ModelObj {
     ft_.kv_cache_popn_func_(kv_cache_, seq_id, num_tokens);
   }
 
+  void CommitAcceptedTokenTreeNodesToKVCache(
+      const std::vector<int64_t>& seq_ids,
+      const std::vector<int64_t>& accepted_leaf_indices) final {
+    IntTuple seq_ids_tuple(seq_ids);
+    IntTuple accepted_leaf_indices_tuple(accepted_leaf_indices);
+    ft_.kv_cache_commit_accepted_token_tree_nodes_func_(kv_cache_, seq_ids_tuple,
+                                                        accepted_leaf_indices_tuple);
+  }
+
   void EnableSlidingWindowForSeq(int64_t seq_id) final {
     if (this->kind == KVStateKind::kNone) {
       return;
@@ -644,7 +687,7 @@ class ModelImpl : public ModelObj {
   ModelMetadata GetMetadata() const final { return ft_.model_metadata_; }
 
   int GetNumAvailablePages() const final {
-    if (this->kind == KVStateKind::kRNNState) {
+    if (this->kind == KVStateKind::kRNNState || this->kind == KVStateKind::kNone) {
       // RNNState does not introduce new page at runtime
       return std::numeric_limits<int>::max();
     } else {
@@ -673,12 +716,19 @@ class ModelImpl : public ModelObj {
 
   void SetPrefillChunkSize(int prefill_chunk_size) final {
     this->prefill_chunk_size_ = prefill_chunk_size;
-    Device device_host{DLDeviceType::kDLCPU, 0};
-    memory::Allocator* allocator =
-        memory::MemoryManager::GetOrCreateAllocator(device_host, memory::AllocatorType::kNaive);
+    Device preferred_host_device = GetPreferredHostDevice(device_);
+    memory::Allocator* allocator = memory::MemoryManager::GetOrCreateAllocator(
+        preferred_host_device, memory::AllocatorType::kNaive);
     ICHECK_NOTNULL(allocator);
     token_ids_storage_ = memory::Storage(
-        allocator->Alloc(device_host, {prefill_chunk_size_}, DataType::Int(32)), allocator);
+        allocator->Alloc(preferred_host_device, {prefill_chunk_size_}, DataType::Int(32)),
+        allocator);
+    if (this->num_stages_ > 1) {
+      // Create a remote NDArray for logits when pipeline parallelism is enabled.
+      disco_logits_arr_ =
+          ft_.Empty({prefill_chunk_size_, vocab_size_}, DataType::Float(32), device_,
+                    /*worker0_only=*/true);
+    }
   }
 
   LogitProcessor CreateLogitProcessor(int max_num_token,
@@ -848,7 +898,6 @@ class ModelImpl : public ModelObj {
     this->attention_sink_size_ =
         json::LookupOrDefault<int64_t>(config, "attention_sink_size", this->attention_sink_size_);
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
-    this->num_shards_ = json::Lookup<int64_t>(config, "tensor_parallel_shards");
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
   }
 
@@ -859,6 +908,7 @@ class ModelImpl : public ModelObj {
   int sliding_window_size_ = -1;
   int attention_sink_size_ = 0;
   int num_shards_ = -1;
+  int num_stages_ = -1;
   int max_num_sequence_ = -1;
   int prefill_chunk_size_ = -1;
   int hidden_size_ = -1;
@@ -885,6 +935,7 @@ class ModelImpl : public ModelObj {
   // Shared NDArray
   memory::Storage token_ids_storage_{nullptr};
   NDArray logit_pos_arr_{nullptr};
+  ObjectRef disco_logits_arr_{nullptr};
   // A boolean indicating if tracing is enabled.
   bool trace_enabled_;
   // An enum indicating whether it's RNN-based.

@@ -44,12 +44,12 @@ class SequenceIDNodePool {
    * \return The allocated radix page.
    */
   SequenceIDNode* Allocate(int64_t seq_id, SequenceIDNode* next) {
-    if (free_node_indicess_.empty()) {
+    if (free_node_indices_.empty()) {
       NewNodeBlock_();
-      CHECK(!free_node_indicess_.empty());
+      CHECK(!free_node_indices_.empty());
     }
-    size_t id = free_node_indicess_.back();
-    free_node_indicess_.pop_back();
+    size_t id = free_node_indices_.back();
+    free_node_indices_.pop_back();
     SequenceIDNode* node = nodes_[id];
     used_nodes_[node] = id;
     node->id = seq_id;
@@ -63,7 +63,7 @@ class SequenceIDNodePool {
    */
   void Free(SequenceIDNode* node) {
     CHECK(used_nodes_.find(node) != used_nodes_.end());
-    free_node_indicess_.push_back(used_nodes_[node]);
+    free_node_indices_.push_back(used_nodes_[node]);
     used_nodes_.erase(node);
   }
 
@@ -72,11 +72,11 @@ class SequenceIDNodePool {
    */
   void Reset() {
     used_nodes_.clear();
-    free_node_indicess_.reserve(nodes_.size());
+    free_node_indices_.reserve(nodes_.size());
     for (size_t i = 0; i < nodes_.size(); ++i) {
       nodes_[i]->id = 0;
       nodes_[i]->next = nullptr;
-      free_node_indicess_[i] = i;
+      free_node_indices_[i] = i;
     }
   }
 
@@ -95,7 +95,7 @@ class SequenceIDNodePool {
   /*! \brief The sequence ID node pool, each element is a sequence ID node pointer. */
   std::vector<SequenceIDNode*> nodes_;
   /*! \brief The indices of free sequence ID node in node pool. */
-  std::vector<size_t> free_node_indicess_;
+  std::vector<size_t> free_node_indices_;
   /*! \brief The map from used paged sequence ID node to its index in node pool. */
   std::unordered_map<SequenceIDNode*, size_t> used_nodes_;
 
@@ -104,10 +104,10 @@ class SequenceIDNodePool {
     size_t node_id_offset = node_blocks_.size() * kNodeBlockSize_;
     node_blocks_.push_back(new SequenceIDNode[kNodeBlockSize_]);
     nodes_.reserve(nodes_.size() + kNodeBlockSize_);
-    free_node_indicess_.reserve(free_node_indicess_.size() + kNodeBlockSize_);
+    free_node_indices_.reserve(free_node_indices_.size() + kNodeBlockSize_);
     for (size_t i = 0; i < kNodeBlockSize_; ++i) {
       nodes_.push_back(&node_blocks_.back()[i]);
-      free_node_indicess_.push_back(i + node_id_offset);
+      free_node_indices_.push_back(i + node_id_offset);
     }
   }
 };
@@ -127,16 +127,16 @@ class SequenceIDNodePool {
  * Also, due to possible pop/push front/back tokens in page, the page is designed as circular
  * buffer, to make full use of each page.
  *
- * Each page records the sequence excatly ends with the prefix tokens stored in page. In other word,
+ * Each page records the sequence exactly ends with the prefix tokens stored in page. In other word,
  * all sequences locate in the boundary of each page, or the end of each page.
  */
-struct RedixPage {
+struct RadixPage {
   /*! \brief The parent page. */
-  RedixPage* parent;
+  RadixPage* parent;
   /*! \brief The first child page. */
-  RedixPage* first_child;
-  /*! \brief The sibling page shareing the same parent page. */
-  RedixPage* next_sibiling;
+  RadixPage* first_child;
+  /*! \brief The sibling page sharing the same parent page. */
+  RadixPage* next_sibling;
   /*! \brief The head of sequence ID linked list. */
   SequenceIDNode* seq_ids;
   /*! \brief The capacity of maximum stored prefix tokens. */
@@ -146,12 +146,12 @@ struct RedixPage {
   /*! \brief The length of stored prefix tokens. The legal value is of [0, capacity). */
   size_t length;
   /*! \brief The offset of first prefix token in memory layout. */
-  static constexpr int kDataOffset = (sizeof(RedixPage*) * 3 + sizeof(SequenceIDNode*) +
+  static constexpr int kDataOffset = (sizeof(RadixPage*) * 3 + sizeof(SequenceIDNode*) +
                                       sizeof(size_t) * 3 + sizeof(int32_t) - 1) /
                                      sizeof(int32_t);
 
   /*!
-   * \brief Overload opeartor [] to get the prefix tokens by index as simple int array.
+   * \brief Overload operator [] to get the prefix tokens by index as simple int array.
    * \param i The prefix token index.
    * \return The value of i-th prefix token.
    */
@@ -165,10 +165,10 @@ struct RedixPage {
    * \param suffix_length The suffix length to extend.
    * \throw Error if suffix length is larger than current vacant space.
    */
-  void Extend(const int64_t* suffix, size_t suffix_length) {
+  void Extend(const int32_t* suffix, size_t suffix_length) {
     CHECK_LE(suffix_length + length, capacity);
     for (int i = 0; i < suffix_length; ++i) {
-      (*this)[i + length] = (int32_t)suffix[i];
+      (*this)[i + length] = suffix[i];
     }
     length += suffix_length;
   }
@@ -188,13 +188,13 @@ struct RedixPage {
    */
   void PopSequence(SequenceIDNodePool* pool, int64_t id) {
     if (seq_ids->id == id) {
-      // If the popped sequencs ID is the first node in linked list,
+      // If the popped sequence ID is the first node in linked list,
       // directly skip from head and free it.
       SequenceIDNode* next = seq_ids->next;
       pool->Free(seq_ids);
       seq_ids = next;
     } else {
-      // If the popped sequencs ID is not the first node in linked list,
+      // If the popped sequence ID is not the first node in linked list,
       // skip it from previous node and free it.
       SequenceIDNode* last = seq_ids;
       SequenceIDNode* cur = seq_ids->next;
@@ -242,7 +242,7 @@ struct RedixPage {
   std::vector<int64_t> FindAllChildSequence() {
     std::vector<int64_t> output = GetLocalSequence();
     if (first_child) {
-      first_child->Iterate([&output](const RedixPage* page) {
+      first_child->Iterate([&output](const RadixPage* page) {
         for (SequenceIDNode* node = page->seq_ids; node; node = node->next) {
           output.push_back(node->id);
         }
@@ -258,20 +258,20 @@ struct RedixPage {
   template <class CallbackFunc>
   void Iterate(CallbackFunc f) {
     f(this);
-    if (next_sibiling) next_sibiling->Iterate(f);
+    if (next_sibling) next_sibling->Iterate(f);
     if (first_child) first_child->Iterate(f);
   }
 
   /*!
    * \brief Get the last sibling of current page.
-   * \return The page whose next_sibling is current page, or nullptr if current is the fisrt_child
+   * \return The page whose next_sibling is current page, or nullptr if current is the first_child
    * of its parent page.
    */
-  RedixPage* GetLastSibling() {
+  RadixPage* GetLastSibling() {
     if (parent == nullptr) return nullptr;
     if (parent->first_child == this) return nullptr;
-    for (RedixPage* child = parent->first_child; child; child = child->next_sibiling) {
-      if (child->next_sibiling == this) return child;
+    for (RadixPage* child = parent->first_child; child; child = child->next_sibling) {
+      if (child->next_sibling == this) return child;
     }
     return nullptr;
   }
@@ -280,19 +280,19 @@ struct RedixPage {
    * \brief Find the child indexed by first token.
    * \return The child page started with first token, or nullptr if no such child page.
    */
-  RedixPage* FindChild(int64_t first_token) {
+  RadixPage* FindChild(int64_t first_token) {
     int32_t casted = first_token;
     // Iterate all child radix pages, as the child radix pages are stored unorderly.
-    for (RedixPage* child = first_child; child; child = child->next_sibiling) {
+    for (RadixPage* child = first_child; child; child = child->next_sibling) {
       if ((*child)[0] == casted) return child;
     }
     return nullptr;
   }
 
   /*! \brief Insert a new child page. */
-  void InsertChild(RedixPage* child) {
+  void InsertChild(RadixPage* child) {
     child->parent = this;
-    child->next_sibiling = first_child;
+    child->next_sibling = first_child;
     first_child = child;
   }
 
@@ -300,12 +300,12 @@ struct RedixPage {
    * \brief Remove a child page.
    * \throw Error if page to be removed is not child page.
    */
-  void RemoveChild(RedixPage* child) {
+  void RemoveChild(RadixPage* child) {
     CHECK(child->parent == this);
     if (first_child == child) {
-      first_child = child->next_sibiling;
+      first_child = child->next_sibling;
     } else {
-      child->GetLastSibling()->next_sibiling = child->next_sibiling;
+      child->GetLastSibling()->next_sibling = child->next_sibling;
     }
   }
 
@@ -315,13 +315,13 @@ struct RedixPage {
    * 1. No sequence ID in current page, as sequence ID is not allowed to exist within page.
    * 2. The current page has child page.
    * 3. The current page has only one child page.
-   * 4. The current page perfix and the child page prefix can be concatenated into one page.
+   * 4. The current page prefix and the child page prefix can be concatenated into one page.
    * \return True if current page is mergable, or false.
    */
   bool Mergeable() {
     if (seq_ids) return false;
     if (!first_child) return false;
-    if (first_child->next_sibiling) return false;
+    if (first_child->next_sibling) return false;
     if (length + first_child->length > capacity) return false;
     return true;
   }
@@ -334,7 +334,7 @@ struct RedixPage {
    * possible return value is [0, page->length], where page->length means the page is completely the
    * prefix of given prefix.
    */
-  size_t MatchPrefix(const int64_t* prefix, size_t prefix_length) {
+  size_t MatchPrefix(const int32_t* prefix, size_t prefix_length) {
     size_t n = std::min(length, prefix_length);
     for (int i = 0; i < n; ++i) {
       if ((*this)[i] != prefix[i]) return i;
@@ -362,16 +362,16 @@ class RadixPagePool {
    * If there is no available page, it will allocate a new radix page block.
    * \return The allocated radix page.
    */
-  RedixPage* Allocate() {
+  RadixPage* Allocate() {
     if (free_page_indices_.empty()) {
       NewPageBlock_();
       CHECK(!free_page_indices_.empty());
     }
     int id = free_page_indices_.back();
     free_page_indices_.pop_back();
-    RedixPage* page = pages_[id];
+    RadixPage* page = pages_[id];
     used_pages_[page] = id;
-    page->parent = page->first_child = page->next_sibiling = nullptr;
+    page->parent = page->first_child = page->next_sibling = nullptr;
     page->capacity = kPageCapacity_;
     page->offset = page->length = 0;
     page->seq_ids = nullptr;
@@ -382,7 +382,7 @@ class RadixPagePool {
    * \brief Free a radix page to pool.
    * \param page The radix page to free.
    */
-  void Free(RedixPage* page) {
+  void Free(RadixPage* page) {
     CHECK_EQ(page->seq_ids, nullptr);
     CHECK(used_pages_.find(page) != used_pages_.end());
     free_page_indices_.push_back(used_pages_[page]);
@@ -402,7 +402,7 @@ class RadixPagePool {
     used_pages_.clear();
     free_page_indices_.reserve(pages_.size());
     for (int i = 0; i < pages_.size(); ++i) {
-      pages_[i]->parent = pages_[i]->first_child = pages_[i]->next_sibiling = nullptr;
+      pages_[i]->parent = pages_[i]->first_child = pages_[i]->next_sibling = nullptr;
       pages_[i]->capacity = kPageCapacity_;
       pages_[i]->offset = pages_[i]->length = 0;
       pages_[i]->seq_ids = nullptr;
@@ -423,17 +423,17 @@ class RadixPagePool {
   /*! \brief The page capacity of each paged radix tree page. */
   static constexpr size_t kPageCapacity_ = 64;
   /*! \brief The page size of each paged radix tree page. */
-  static constexpr size_t kPageSize_ = kPageCapacity_ + RedixPage::kDataOffset;
+  static constexpr size_t kPageSize_ = kPageCapacity_ + RadixPage::kDataOffset;
   /*! \brief The raw paged radix tree page block pool,
   each element is a raw paged radix tree page array. */
   std::vector<int32_t*> page_blocks_;
   /*! \brief The paged radix tree page pool,
   each element is a raw paged radix tree page pointer. */
-  std::vector<RedixPage*> pages_;
+  std::vector<RadixPage*> pages_;
   /*! \brief The indices of free paged radix page in page pool. */
   std::vector<size_t> free_page_indices_;
   /*! \brief The map from used paged radix tree page to its index in page pool. */
-  std::unordered_map<RedixPage*, size_t> used_pages_;
+  std::unordered_map<RadixPage*, size_t> used_pages_;
 
   /*! \brief Allocate a new page pool block. */
   void NewPageBlock_() {
@@ -442,7 +442,7 @@ class RadixPagePool {
     pages_.reserve(pages_.size() + kPageBlockSize_);
     free_page_indices_.reserve(free_page_indices_.size() + kPageBlockSize_);
     for (size_t i = 0; i < kPageBlockSize_; ++i) {
-      pages_.push_back(reinterpret_cast<RedixPage*>(page_blocks_.back() + i * kPageSize_));
+      pages_.push_back(reinterpret_cast<RadixPage*>(page_blocks_.back() + i * kPageSize_));
       free_page_indices_.push_back(i + page_id_offset);
     }
   }
@@ -456,20 +456,20 @@ class RadixPagePool {
 class PagedRadixTreeImpl : public PagedRadixTreeObj {
  public:
   /*! \brief The map from sequence to paged radix tree node it is stored. */
-  std::unordered_map<int32_t, RedixPage*> seq2page;
+  std::unordered_map<int32_t, RadixPage*> seq2page;
   /*! \brief The sequence ID node pool. */
   SequenceIDNodePool* seq_id_node_pool = nullptr;
   /*! \brief The radix page pool. */
   RadixPagePool* radix_page_pool = nullptr;
   /*! \brief The root page of paged radix tree. */
-  RedixPage* root = nullptr;
+  RadixPage* root = nullptr;
 
   explicit PagedRadixTreeImpl() {
     seq_id_node_pool = new SequenceIDNodePool();
     radix_page_pool = new RadixPagePool();
 
-    root = reinterpret_cast<RedixPage*>(new int32_t[RedixPage::kDataOffset]);
-    root->parent = root->first_child = root->next_sibiling = nullptr;
+    root = reinterpret_cast<RadixPage*>(new int32_t[RadixPage::kDataOffset]);
+    root->parent = root->first_child = root->next_sibling = nullptr;
     root->offset = root->length = root->capacity = 0;
     root->seq_ids = nullptr;
   }
@@ -493,7 +493,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
     size_t length = GetSequenceLength(seq_id);
     std::vector<int64_t> output(length);
     size_t offset = length;
-    for (RedixPage* page = seq2page[seq_id]; page; page = page->parent) {
+    for (RadixPage* page = seq2page[seq_id]; page; page = page->parent) {
       offset -= page->length;
       for (int i = 0; i < page->length; ++i) {
         output[offset + i] = (*page)[i];
@@ -507,8 +507,8 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
    * \param tokens The prefix tokens for reference.
    * \return The pair of matched prefix length and the array of matched sequences indices.
    */
-  std::pair<size_t, std::vector<int64_t>> MatchPrefix(IntTuple tokens) {
-    const int64_t* prefix = tokens.data();
+  std::pair<size_t, std::vector<int64_t>> MatchPrefix(const std::vector<int32_t>& tokens) {
+    const int32_t* prefix = tokens.data();
     size_t length = tokens.size();
     auto [page, offset, in_page_offset] = MatchSequence(root, prefix, length);
     if (!offset) return std::make_pair(0, std::vector<int64_t>());
@@ -524,7 +524,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
   size_t GetSequenceLength(int64_t seq_id) {
     CHECK(seq2page.find(seq_id) != seq2page.end());
     size_t length = 0;
-    for (RedixPage* page = seq2page[seq_id]; page; page = page->parent) {
+    for (RadixPage* page = seq2page[seq_id]; page; page = page->parent) {
       length += page->length;
     }
     return length;
@@ -546,7 +546,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
     CHECK_GT(forked_offset, 0);
     size_t length = GetSequenceLength(parent_seq_id);
     CHECK_LE(forked_offset, length);
-    for (RedixPage* page = seq2page[parent_seq_id]; page; page = page->parent) {
+    for (RadixPage* page = seq2page[parent_seq_id]; page; page = page->parent) {
       if (forked_offset >= length - page->length) {
         if (forked_offset < length) {
           // Split radix page if forked position is within page
@@ -578,11 +578,11 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
    * \param tokens The given tokens to extend.
    * \throw Error if sequence ID is not valid.
    */
-  void ExtendSequence(int64_t seq_id, IntTuple tokens) {
+  void ExtendSequence(int64_t seq_id, const std::vector<int32_t>& tokens) {
     CHECK(seq2page.find(seq_id) != seq2page.end());
-    const int64_t* suffix = tokens.data();
+    const int32_t* suffix = tokens.data();
     size_t length = tokens.size();
-    RedixPage* original_page = seq2page[seq_id];
+    RadixPage* original_page = seq2page[seq_id];
     original_page->PopSequence(seq_id_node_pool, seq_id);
     auto [page, offset, in_page_offset] = MatchSequence(original_page, suffix, length);
     if (in_page_offset < page->length) {
@@ -597,7 +597,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
     }
     while (offset < length) {
       // Allocate new radix page and extend tokens
-      RedixPage* new_page = radix_page_pool->Allocate();
+      RadixPage* new_page = radix_page_pool->Allocate();
       page->InsertChild(new_page);
       page = new_page;
       size_t suffix_length = std::min(page->capacity - page->length, length - offset);
@@ -628,14 +628,14 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
       AddSequence(seq_id);
       return;
     }
-    RedixPage* page = seq2page[seq_id];
+    RadixPage* page = seq2page[seq_id];
     // Remove the sequence temporarily, but keeping the data and starting rolling back.
     page->PopSequence(seq_id_node_pool, seq_id);
     seq2page.erase(seq_id);
     while (page->length <= num_tokens) {
       // Roll back entire page
       num_tokens -= page->length;
-      RedixPage* parent = page->parent;
+      RadixPage* parent = page->parent;
       if (page->seq_ids == nullptr && page->first_child == nullptr) {
         // The leaf page is removable
         parent->RemoveChild(page);
@@ -651,7 +651,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
       seq2page[seq_id] = page;
       return;
     }
-    // Split page for rolled back seuqence
+    // Split page for rolled back sequence
     if (num_tokens) {
       page = SplitPage(page, page->length - num_tokens);
     }
@@ -666,11 +666,11 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
    * \throw Error if sequence ID is not valid.
    */
   void RemoveSequence(int64_t seq_id) {
-    RedixPage* page = seq2page[seq_id];
+    RadixPage* page = seq2page[seq_id];
     page->PopSequence(seq_id_node_pool, seq_id);
     seq2page.erase(seq_id);
     while (page->parent && !page->seq_ids && !page->first_child) {
-      RedixPage* parent = page->parent;
+      RadixPage* parent = page->parent;
       parent->RemoveChild(page);
       radix_page_pool->Free(page);
       page = parent;
@@ -691,7 +691,7 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
     radix_page_pool->Reset();
     seq_id_node_pool->Reset();
     seq2page.clear();
-    root->parent = root->first_child = root->next_sibiling = nullptr;
+    root->parent = root->first_child = root->next_sibling = nullptr;
     root->offset = root->length = root->capacity = 0;
     root->seq_ids = nullptr;
   }
@@ -710,15 +710,15 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
    * And the page to be merged should be page->Mergeable().
    * \param page The parent radix tree page.
    */
-  void MergePage(RedixPage* page) {
+  void MergePage(RadixPage* page) {
     CHECK(page->Mergeable());
-    RedixPage* child = page->first_child;
+    RadixPage* child = page->first_child;
     for (int i = 0; i < child->length; ++i) {
       (*page)[i + page->length] = (*child)[i];
     }
     page->length += child->length;
     page->first_child = child->first_child;
-    for (RedixPage* p = child->first_child; p; p = p->next_sibiling) {
+    for (RadixPage* p = child->first_child; p; p = p->next_sibling) {
       p->parent = page;
     }
     page->seq_ids = child->seq_ids;
@@ -729,19 +729,19 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
   }
 
   /*!
-   * \brief Split a radix tree page at given postition, to accept new sequence.
+   * \brief Split a radix tree page at given position, to accept new sequence.
    * e.g. SplitPage([1, 2, 3, 4, 5], 2) = [1, 2, _, _, _] -> [3, 4, 5, _, _].
    * \param page The radix tree page to split.
    * \param offset The position to split the radix tree page.
    * \return The splitted radix tree page. It can be different from the input radix tree page, as
    * there may be implicit radix tree page merge.
    */
-  RedixPage* SplitPage(RedixPage* page, size_t offset) {
+  RadixPage* SplitPage(RadixPage* page, size_t offset) {
     CHECK_LT(offset, page->length);
-    RedixPage* child = radix_page_pool->Allocate();
+    RadixPage* child = radix_page_pool->Allocate();
     child->parent = page;
     child->first_child = page->first_child;
-    for (RedixPage* p = page->first_child; p; p = p->next_sibiling) {
+    for (RadixPage* p = page->first_child; p; p = p->next_sibling) {
       p->parent = child;
     }
     page->first_child = child;
@@ -772,11 +772,11 @@ class PagedRadixTreeImpl : public PagedRadixTreeObj {
    * \param tokens The given tokens to match.
    * \param length The length of given tokens.
    */
-  std::tuple<RedixPage*, size_t, size_t> MatchSequence(RedixPage* page, const int64_t* tokens,
+  std::tuple<RadixPage*, size_t, size_t> MatchSequence(RadixPage* page, const int32_t* tokens,
                                                        size_t length) {
     size_t offset = 0;
     while (offset < length) {
-      if (RedixPage* child = page->FindChild(tokens[offset])) {
+      if (RadixPage* child = page->FindChild(tokens[offset])) {
         // If child page starts with offset-th token, common prefix at least ends with child page
         size_t matched_offset = child->MatchPrefix(tokens + offset, length - offset);
         offset += matched_offset;
@@ -805,12 +805,16 @@ TVM_REGISTER_GLOBAL("mlc.serve.PagedRadixTree").set_body_typed([]() {
 });
 TVM_REGISTER_GLOBAL("mlc.serve.PagedRadixTreeMatchPrefix")
     .set_body_typed([](PagedRadixTree paged_radix_tree, IntTuple tokens) {
-      auto [offset, seq_ids] = paged_radix_tree->MatchPrefix(tokens);
+      std::vector<int32_t> token_ids{tokens.begin(), tokens.end()};
+      auto [offset, seq_ids] = paged_radix_tree->MatchPrefix(token_ids);
       seq_ids.insert(seq_ids.begin(), offset);
       return IntTuple(seq_ids);
     });
 TVM_REGISTER_GLOBAL("mlc.serve.PagedRadixTreeExtendSequence")
-    .set_body_method<PagedRadixTree>(&PagedRadixTreeObj::ExtendSequence);
+    .set_body_typed([](PagedRadixTree paged_radix_tree, int64_t seq_id, IntTuple tokens) {
+      std::vector<int32_t> token_ids{tokens.begin(), tokens.end()};
+      paged_radix_tree->ExtendSequence(seq_id, std::move(token_ids));
+    });
 TVM_REGISTER_GLOBAL("mlc.serve.PagedRadixTreeRollBackSequence")
     .set_body_typed([](PagedRadixTree paged_radix_tree, int64_t seq_id, int64_t num_tokens) {
       paged_radix_tree->RollBackSequence(seq_id, num_tokens);

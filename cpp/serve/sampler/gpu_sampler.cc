@@ -15,6 +15,20 @@ namespace mlc {
 namespace llm {
 namespace serve {
 
+inline bool FlashInferSamplingAvailable(Device device) {
+  // Device must be CUDA, and FlashInfer must be enabled.
+  if (device.device_type != DLDeviceType::kDLCUDA ||
+      Registry::Get("flashinfer.sampling.parallel_sampling_from_prob") == nullptr) {
+    return false;
+  }
+  // Compute version must be at least 8.0
+  TVMRetValue rv;
+  DeviceAPI::Get(device)->GetAttr(device, kComputeVersion, &rv);
+  std::string compute_version = rv;
+  std::string major_version = compute_version.substr(0, compute_version.find('.'));
+  return std::stoi(major_version) >= 8;
+}
+
 inline void CopyArray(NDArray src, NDArray dst, TVMStreamHandle copy_stream) {
   DLTensor dl_dst = *(dst.operator->());
   NDArray::CopyFromTo(src.operator->(), &dl_dst, copy_stream);
@@ -38,6 +52,7 @@ class GPUSampler : public SamplerObj {
                       Optional<EventTraceRecorder> trace_recorder)
       : max_num_sample_(max_num_sample),
         vocab_size_(vocab_size),
+        flashinfer_sampling_available_(FlashInferSamplingAvailable(device)),
         device_(device),
         gpu_multinomial_from_uniform_func_(ft->gpu_multinomial_from_uniform_func_),
         gpu_argsort_probs_func_(ft->gpu_argsort_probs_func_),
@@ -54,23 +69,28 @@ class GPUSampler : public SamplerObj {
     flashinfer_multinomial_sample_func_ =
         Registry::Get("flashinfer.sampling.parallel_sampling_from_prob");
 
-    DLDevice device_cpu{DLDeviceType::kDLCPU, /*device_id=*/0};
+    Device preferred_host_device = GetPreferredHostDevice(device);
     // We support at most 5 top prob results for each sequence.
     // Initialize auxiliary arrays on CPU.
-    uniform_samples_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    sample_indices_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    top_p_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    top_p_init_pivots_host_ =
-        NDArray::Empty({max_num_sample, num_top_p_cutoff_pivots_}, dtype_f32_, device_cpu);
-    top_prob_offsets_host_ = NDArray::Empty({max_num_sample * 5}, dtype_i32_, device_cpu);
-    draft_tokens_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_first_child_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_next_sibling_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    token_tree_parent_ptr_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    sampled_token_ids_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, device_cpu);
-    sampled_probs_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, device_cpu);
-    top_prob_probs_host_ = NDArray::Empty({max_num_sample * 5}, dtype_f32_, device_cpu);
-    top_prob_indices_host_ = NDArray::Empty({max_num_sample * 5}, dtype_i32_, device_cpu);
+    uniform_samples_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    sample_indices_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    top_p_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    top_p_init_pivots_host_ = NDArray::Empty({max_num_sample, num_top_p_cutoff_pivots_}, dtype_f32_,
+                                             preferred_host_device);
+    top_prob_offsets_host_ =
+        NDArray::Empty({max_num_sample * 5}, dtype_i32_, preferred_host_device);
+    draft_tokens_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_first_child_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_next_sibling_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    token_tree_parent_ptr_host_ =
+        NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    sampled_token_ids_host_ = NDArray::Empty({max_num_sample}, dtype_i32_, preferred_host_device);
+    sampled_probs_host_ = NDArray::Empty({max_num_sample}, dtype_f32_, preferred_host_device);
+    top_prob_probs_host_ = NDArray::Empty({max_num_sample * 5}, dtype_f32_, preferred_host_device);
+    top_prob_indices_host_ =
+        NDArray::Empty({max_num_sample * 5}, dtype_i32_, preferred_host_device);
     // Initialize auxiliary arrays on GPU.
     uniform_samples_device_ = NDArray::Empty({max_num_sample}, dtype_f32_, device);
     sample_indices_device_ = NDArray::Empty({max_num_sample}, dtype_i32_, device);
@@ -183,7 +203,7 @@ class GPUSampler : public SamplerObj {
       const std::vector<int>& cum_verify_lengths, const Array<GenerationConfig>& generation_cfg,
       const std::vector<RandomGenerator*>& rngs,
       const std::vector<std::vector<SampleResult>>& draft_output_tokens,
-      NDArray draft_probs_on_device) final {
+      const std::vector<int64_t>& token_tree_parent_ptr, NDArray draft_probs_on_device) final {
     NVTXScopedRange nvtx_scope("BatchVerifyDraftTokensWithProbAfterTopP");
     std::vector<std::vector<SampleResult>> sample_results;
     // probs_on_device: (n, v)
@@ -213,7 +233,7 @@ class GPUSampler : public SamplerObj {
       ICHECK_EQ(draft_output_tokens_i.size() + 1, end - start);
       for (int j = 0; j < end - start - 1; j++) {
         // Copy sampled token id
-        p_draft_tokens_host[start + j + 1] = draft_output_tokens_i[j].sampled_token_id.first;
+        p_draft_tokens_host[start + j + 1] = draft_output_tokens_i[j].GetTokenId();
       }
     }
     CopyArray(draft_tokens_host, draft_tokens_device, copy_stream_);
@@ -232,21 +252,29 @@ class GPUSampler : public SamplerObj {
         token_tree_parent_ptr_device_.CreateView({num_sequence}, dtype_i32_);
     std::vector<int> token_tree_child_to_parent(/*n=*/num_nodes);
 
+    int* token_tree_first_child_ptr_host = static_cast<int*>(token_tree_first_child_host->data);
+    int* token_tree_next_sibling_ptr_host = static_cast<int*>(token_tree_next_sibling_host->data);
     // Build the tree structure on CPU
     for (int i = 0; i < num_sequence; i++) {
       // Assuming no tree structure for now
       int start = cum_verify_lengths[i];
       int end = cum_verify_lengths[i + 1];
       ICHECK_GE(end - start, 2);
-      token_tree_child_to_parent[start] = -1;  // root has no parent
       for (int j = 0; j < end - start; j++) {
         int cur_node = j + start;
-        int child_node = j + 1 >= end - start ? -1 : cur_node + 1;
-        static_cast<int*>(token_tree_first_child_host->data)[cur_node] = child_node;
-        if (child_node != -1) {
-          token_tree_child_to_parent[child_node] = cur_node;
+        int parent_node =
+            token_tree_parent_ptr[cur_node] != -1 ? token_tree_parent_ptr[cur_node] + start : -1;
+        token_tree_first_child_ptr_host[cur_node] = -1;
+        if (parent_node != -1 && token_tree_first_child_ptr_host[parent_node] == -1) {
+          token_tree_first_child_ptr_host[parent_node] = cur_node;
         }
-        static_cast<int*>(token_tree_next_sibling_host->data)[cur_node] = -1;
+        token_tree_child_to_parent[cur_node] = parent_node;
+        if (cur_node + 1 < end && token_tree_parent_ptr[cur_node - start + 1] ==
+                                      token_tree_parent_ptr[cur_node - start]) {
+          token_tree_next_sibling_ptr_host[cur_node] = cur_node + 1;
+        } else {
+          token_tree_next_sibling_ptr_host[cur_node] = -1;
+        }
       }
       static_cast<int*>(token_tree_parent_ptr_host->data)[i] = start;  // point to the root
     }
@@ -545,7 +573,7 @@ class GPUSampler : public SamplerObj {
     if (!need_top_p && !need_prob_values) {
       // - Short path: If top_p and prob values are not needed, we directly sample from multinomial.
       SyncCopyStream(device_, compute_stream_, copy_stream_);
-      if (flashinfer_multinomial_sample_func_ != nullptr) {
+      if (flashinfer_sampling_available_) {
         sampled_token_ids_device =
             sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
         (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,
@@ -588,7 +616,7 @@ class GPUSampler : public SamplerObj {
                                       uniform_samples_device, sample_indices_device, top_p_device);
     } else {
       // - Sample without top_p.
-      if (flashinfer_multinomial_sample_func_ != nullptr) {
+      if (flashinfer_sampling_available_) {
         sampled_token_ids_device =
             sampled_token_ids_device_.CreateView({sample_indices_device->shape[0]}, dtype_i32_);
         (*flashinfer_multinomial_sample_func_)(probs_on_device, uniform_samples_device,
@@ -660,6 +688,7 @@ class GPUSampler : public SamplerObj {
   const int vocab_size_;
   const DLDataType dtype_i32_ = DataType::Int(32);
   const DLDataType dtype_f32_ = DataType::Float(32);
+  const bool flashinfer_sampling_available_;
   // Functions for sampling on GPU.
   Device device_;
   PackedFunc gpu_multinomial_from_uniform_func_;

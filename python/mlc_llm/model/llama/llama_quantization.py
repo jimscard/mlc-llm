@@ -1,5 +1,6 @@
 """This file specifies how MLC's Llama parameters are quantized using group quantization
 or other formats."""
+
 from typing import Tuple
 
 from tvm.relax.frontend import nn
@@ -13,7 +14,7 @@ from mlc_llm.quantization import (
     PerTensorQuantize,
 )
 
-from .llama_model import LlamaConfig, LlamaForCasualLM
+from .llama_model import LlamaConfig, LlamaForCausalLM
 
 
 def group_quant(
@@ -21,9 +22,10 @@ def group_quant(
     quantization: GroupQuantize,
 ) -> Tuple[nn.Module, QuantizeMapping]:
     """Quantize a Llama-architecture model using group quantization."""
-    model: nn.Module = LlamaForCasualLM(model_config)
+    model: nn.Module = LlamaForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
+    quantization.tensor_parallel_shards = model_config.tensor_parallel_shards
     model = quantization.quantize_model(
         model,
         quant_map,
@@ -37,7 +39,7 @@ def ft_quant(
     quantization: FTQuantize,
 ) -> Tuple[nn.Module, QuantizeMapping]:
     """Quantize a Llama-architecture model using FasterTransformer quantization."""
-    model: nn.Module = LlamaForCasualLM(model_config)
+    model: nn.Module = LlamaForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
     model = quantization.quantize_model(
@@ -53,7 +55,7 @@ def awq_quant(
     quantization: AWQQuantize,
 ) -> Tuple[nn.Module, QuantizeMapping]:
     """Quantize a Llama-architecture model using Activation-aware Weight Quantization(AWQ)."""
-    model: nn.Module = LlamaForCasualLM(model_config)
+    model: nn.Module = LlamaForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
     model = quantization.quantize_model(
@@ -69,7 +71,7 @@ def no_quant(
     quantization: NoQuantize,
 ) -> Tuple[nn.Module, QuantizeMapping]:
     """Quantize a Llama2 model without quantization."""
-    model: nn.Module = LlamaForCasualLM(model_config)
+    model: nn.Module = LlamaForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
     return model, quant_map
@@ -80,12 +82,13 @@ def per_tensor_quant(
     quantization: PerTensorQuantize,
 ) -> Tuple[nn.Module, QuantizeMapping]:
     """Quantize a Llama-architecture model using per-tensor quantization."""
-    model: nn.Module = LlamaForCasualLM(model_config)
+    model: nn.Module = LlamaForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
     model = quantization.quantize_model(
         model,
         quant_map,
         "",
+        tensor_parallel_shards=model_config.tensor_parallel_shards,
     )
     return model, quant_map

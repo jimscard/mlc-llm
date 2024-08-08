@@ -11,7 +11,7 @@
 #include <string>
 
 #include "../serve/threaded_engine.h"
-#include "../streamer.h"
+#include "../tokenizers/streamer.h"
 #include "conv_template.h"
 #include "openai_api_protocol.h"
 
@@ -41,19 +41,32 @@ class JSONFFIEngine {
 
   std::string GetLastError();
 
-  std::string JSONMetrics();
-
   void ExitBackgroundLoop();
 
  protected:
+  /*! \brief local request state entry, one per reply stream. */
+  struct RequestState {
+    /*! \brief model to fill in reply. */
+    std::string model;
+    /*! \brief text streamer for each stream */
+    std::vector<TextStreamer> streamer;
+  };
+
   std::unique_ptr<ThreadedEngine> engine_;
   std::string err_;
   PackedFunc request_stream_callback_;
-  TextStreamer streamer_;  // TODO: Support "n", and support different streamers for each request
+  // tokenizer
+  Tokenizer tokenizer_;
+  // conversation template
   Conversation conv_template_;
+  // generation config
   GenerationConfig default_generation_config_;
+  // model config
   ModelConfig model_config_;
+  // local device
   DLDevice device_;
+  // request state map
+  std::unordered_map<String, RequestState> request_map_;
 };
 
 }  // namespace json_ffi

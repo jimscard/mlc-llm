@@ -11,7 +11,7 @@
 #include <tvm/runtime/object.h>
 #include <tvm/runtime/packed_func.h>
 
-#include "../tokenizers.h"
+#include "../tokenizers/tokenizers.h"
 #include "config.h"
 #include "data.h"
 
@@ -47,12 +47,14 @@ class RequestNode : public Object {
    * "-1" means the input length is unknown due to the existence
    * of untokenized text data.
    */
-  int num_input_tokens = -1;
+  int prompt_tokens = -1;
   /*!
    * \brief The sampling configuration which may contain temperature,
    * top_p, repetition_penalty, max_gen_len, etc.
    */
   GenerationConfig generation_cfg;
+  /*! \brief Backward reference to the request state. */
+  Object* rstate = nullptr;
 
   static constexpr const char* _type_key = "mlc.serve.Request";
   static constexpr const bool _type_has_method_sequal_reduce = false;
@@ -73,7 +75,7 @@ class Request : public ObjectRef {
    */
   static Request FromUntokenized(const Request& request, const Tokenizer& tokenizer);
 
-  TVM_DEFINE_OBJECT_REF_METHODS(Request, ObjectRef, RequestNode);
+  TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(Request, ObjectRef, RequestNode);
 };
 
 }  // namespace serve

@@ -11,12 +11,15 @@ from mlc_llm.quantization.quantization import Quantization
 from .baichuan import baichuan_loader, baichuan_model, baichuan_quantization
 from .bert import bert_loader, bert_model, bert_quantization
 from .chatglm3 import chatglm3_loader, chatglm3_model, chatglm3_quantization
+from .cohere import cohere_loader, cohere_model, cohere_quantization
 from .eagle import eagle_loader, eagle_model, eagle_quantization
 from .gemma import gemma_loader, gemma_model, gemma_quantization
+from .gemma2 import gemma2_loader, gemma2_model, gemma2_quantization
 from .gpt2 import gpt2_loader, gpt2_model, gpt2_quantization
 from .gpt_bigcode import gpt_bigcode_loader, gpt_bigcode_model, gpt_bigcode_quantization
 from .gpt_neox import gpt_neox_loader, gpt_neox_model, gpt_neox_quantization
 from .internlm import internlm_loader, internlm_model, internlm_quantization
+from .internlm2 import internlm2_loader, internlm2_model, internlm2_quantization
 from .llama import llama_loader, llama_model, llama_quantization
 from .llava import llava_loader, llava_model, llava_quantization
 from .medusa import medusa_loader, medusa_model, medusa_quantization
@@ -25,11 +28,14 @@ from .mixtral import mixtral_loader, mixtral_model, mixtral_quantization
 from .orion import orion_loader, orion_model, orion_quantization
 from .phi import phi_loader, phi_model, phi_quantization
 from .phi3 import phi3_loader, phi3_model, phi3_quantization
+from .phi3v import phi3v_loader, phi3v_model, phi3v_quantization
 from .qwen import qwen_loader, qwen_model, qwen_quantization
 from .qwen2 import qwen2_loader, qwen2_model, qwen2_quantization
+from .qwen2_moe import qwen2_moe_loader, qwen2_moe_model, qwen2_moe_quantization
 from .rwkv5 import rwkv5_loader, rwkv5_model, rwkv5_quantization
 from .rwkv6 import rwkv6_loader, rwkv6_model, rwkv6_quantization
 from .stable_lm import stablelm_loader, stablelm_model, stablelm_quantization
+from .starcoder2 import starcoder2_loader, starcoder2_model, starcoder2_quantization
 
 ModelConfig = Any
 """A ModelConfig is an object that represents a model architecture. It is required to have
@@ -76,7 +82,7 @@ class Model:
 MODELS: Dict[str, Model] = {
     "llama": Model(
         name="llama",
-        model=llama_model.LlamaForCasualLM,
+        model=llama_model.LlamaForCausalLM,
         config=llama_model.LlamaConfig,
         source={
             "huggingface-torch": llama_loader.huggingface,
@@ -117,6 +123,19 @@ MODELS: Dict[str, Model] = {
         quantize={
             "no-quant": gemma_quantization.no_quant,
             "group-quant": gemma_quantization.group_quant,
+        },
+    ),
+    "gemma2": Model(
+        name="gemma2",
+        model=gemma2_model.Gemma2ForCausalLM,
+        config=gemma2_model.Gemma2Config,
+        source={
+            "huggingface-torch": gemma2_loader.huggingface,
+            "huggingface-safetensor": gemma2_loader.huggingface,
+        },
+        quantize={
+            "no-quant": gemma2_quantization.no_quant,
+            "group-quant": gemma2_quantization.group_quant,
         },
     ),
     "gpt2": Model(
@@ -218,6 +237,20 @@ MODELS: Dict[str, Model] = {
             "ft-quant": phi3_quantization.ft_quant,
         },
     ),
+    "phi3_v": Model(
+        name="phi3_v",
+        model=phi3v_model.Phi3VForCausalLM,
+        config=phi3v_model.Phi3VConfig,
+        source={
+            "huggingface-torch": phi3v_loader.huggingface,
+            "huggingface-safetensor": phi3v_loader.huggingface,
+        },
+        quantize={
+            "no-quant": phi3v_quantization.no_quant,
+            "group-quant": phi3v_quantization.group_quant,
+            "ft-quant": phi3v_quantization.ft_quant,
+        },
+    ),
     "qwen": Model(
         name="qwen",
         model=qwen_model.QWenLMHeadModel,
@@ -244,6 +277,20 @@ MODELS: Dict[str, Model] = {
             "no-quant": qwen2_quantization.no_quant,
             "group-quant": qwen2_quantization.group_quant,
             "ft-quant": qwen2_quantization.ft_quant,
+        },
+    ),
+    "qwen2_moe": Model(
+        name="qwen2_moe",
+        model=qwen2_moe_model.Qwen2MoeForCausalLM,
+        config=qwen2_moe_model.Qwen2MoeConfig,
+        source={
+            "huggingface-torch": qwen2_moe_loader.huggingface,
+            "huggingface-safetensor": qwen2_moe_loader.huggingface,
+        },
+        quantize={
+            "no-quant": qwen2_moe_quantization.no_quant,
+            "group-quant": qwen2_moe_quantization.group_quant,
+            "ft-quant": qwen2_moe_quantization.ft_quant,
         },
     ),
     "stablelm": Model(
@@ -286,6 +333,20 @@ MODELS: Dict[str, Model] = {
             "no-quant": internlm_quantization.no_quant,
             "group-quant": internlm_quantization.group_quant,
             "ft-quant": internlm_quantization.ft_quant,
+        },
+    ),
+    "internlm2": Model(
+        name="internlm2",
+        model=internlm2_model.InternLM2ForCausalLM,
+        config=internlm2_model.InternLM2Config,
+        source={
+            "huggingface-torch": internlm2_loader.huggingface,
+            "huggingface-safetensor": internlm2_loader.huggingface,
+        },
+        quantize={
+            "no-quant": internlm2_quantization.no_quant,
+            "group-quant": internlm2_quantization.group_quant,
+            "ft-quant": internlm2_quantization.ft_quant,
         },
     ),
     "rwkv5": Model(
@@ -396,6 +457,34 @@ MODELS: Dict[str, Model] = {
         },
         quantize={
             "no-quant": medusa_quantization.no_quant,
+        },
+    ),
+    "starcoder2": Model(
+        name="starcoder2",
+        model=starcoder2_model.Starcoder2ForCausalLM,
+        config=starcoder2_model.Starcoder2Config,
+        source={
+            "huggingface-torch": starcoder2_loader.huggingface,
+            "huggingface-safetensor": starcoder2_loader.huggingface,
+        },
+        quantize={
+            "no-quant": starcoder2_quantization.no_quant,
+            "group-quant": starcoder2_quantization.group_quant,
+            "ft-quant": starcoder2_quantization.ft_quant,
+        },
+    ),
+    "cohere": Model(
+        name="cohere",
+        model=cohere_model.CohereForCausalLM,
+        config=cohere_model.CohereConfig,
+        source={
+            "huggingface-torch": cohere_loader.huggingface,
+            "huggingface-safetensor": cohere_loader.huggingface,
+        },
+        quantize={
+            "no-quant": cohere_quantization.no_quant,
+            "group-quant": cohere_quantization.group_quant,
+            "ft-quant": cohere_quantization.ft_quant,
         },
     ),
 }

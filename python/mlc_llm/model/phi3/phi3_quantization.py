@@ -1,4 +1,4 @@
-"""This file specifies how MLC's Llama parameters are quantized using group quantization
+"""This file specifies how MLC's Phi-3 parameters are quantized using group quantization
 or other formats."""
 
 from typing import Tuple
@@ -19,6 +19,7 @@ def group_quant(
     model: nn.Module = Phi3ForCausalLM(model_config)
     model.to(quantization.model_dtype)
     quant_map = QuantizeMapping({}, {})
+    quantization.tensor_parallel_shards = model_config.tensor_parallel_shards
     model = quantization.quantize_model(
         model,
         quant_map,

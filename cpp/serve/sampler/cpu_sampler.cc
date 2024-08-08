@@ -178,6 +178,11 @@ void RenormalizeProbByTopP(NDArray prob, int unit_offset, double top_p, double e
   ICHECK(prob.DataType() == DataType::Float(32));
   ICHECK_EQ(prob->device.device_type, DLDeviceType::kDLCPU);
 
+  if (top_p == 1.0) {
+    // No renormalization is needed if top_p is 1.
+    return;
+  }
+
   int vocab_size = prob->shape[prob->ndim - 1];
   float* __restrict p_prob =
       static_cast<float*>(__builtin_assume_aligned(prob->data, 4)) + (unit_offset * vocab_size);
@@ -408,7 +413,7 @@ class CPUSampler : public SamplerObj {
       const std::vector<int>& cum_verify_lengths, const Array<GenerationConfig>& generation_cfg,
       const std::vector<RandomGenerator*>& rngs,
       const std::vector<std::vector<SampleResult>>& draft_output_tokens,
-      NDArray draft_probs_on_device) final {
+      const std::vector<int64_t>& token_tree_parent_ptr, NDArray draft_probs_on_device) final {
     // probs_on_host: (n, v)
     RECORD_EVENT(trace_recorder_, request_ids, "start draft verification");
     CHECK_EQ(probs_on_host->ndim, 2);
@@ -430,11 +435,17 @@ class CPUSampler : public SamplerObj {
           int verify_start = cum_verify_lengths[i];
           int verify_end = cum_verify_lengths[i + 1];
 
+          CHECK_EQ(token_tree_parent_ptr[verify_start], -1);
+          for (int j = verify_start + 1; j < verify_end; ++j) {
+            CHECK_EQ(token_tree_parent_ptr[j], j - verify_start)
+                << "CPU sampler only supports chain-style draft tokens.";
+          }
+
           int cur_token_idx = 0;
           // Sub 1 to ignore the last prediction.
           for (; cur_token_idx < verify_end - verify_start - 1; ++cur_token_idx) {
             float* p_probs = global_p_probs + (verify_start + cur_token_idx) * vocab_size;
-            int cur_token = draft_output_tokens[i][cur_token_idx].sampled_token_id.first;
+            int cur_token = draft_output_tokens[i][cur_token_idx].GetTokenId();
             float q_value = draft_output_tokens[i][cur_token_idx].sampled_token_id.second;
             float p_value = p_probs[cur_token];
 

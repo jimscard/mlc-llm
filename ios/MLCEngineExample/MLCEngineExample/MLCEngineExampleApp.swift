@@ -1,5 +1,3 @@
-// NOTE: This example is still work in progress
-//
 // This is a minimum example App to interact with MLC Engine
 // This app is mainly created with minimalism in mind for
 // example and quick testing purposes.
@@ -12,7 +10,6 @@
 import Foundation
 import SwiftUI
 
-// Import MLCSwift
 import MLCSwift
 
 class AppState: ObservableObject {
@@ -23,7 +20,7 @@ class AppState: ObservableObject {
     private let bundleURL = Bundle.main.bundleURL.appending(path: "bundle")
     // model path, this must match a builtin
     // file name in prepare_params.sh
-    private let modelPath = "llama3"
+    private let modelPath = "Llama-3-8B-Instruct-q3f16_1-MLC"
     // model lib identifier of within the packaged library
     // make sure we run "mlc_llm package"
     private let modelLib = "llama_q3f16_1"
@@ -36,7 +33,7 @@ class AppState: ObservableObject {
         Task {
             let modelLocalPath = bundleURL.appending(path: modelPath).path()
             // Step 0: load the engine
-            engine.reload(modelPath: modelLocalPath, modelLib: modelLib)
+            await engine.reload(modelPath: modelLocalPath, modelLib: modelLib)
 
             // run chat completion as in OpenAI API style
             for await res in await engine.chat.completions.create(
@@ -45,13 +42,18 @@ class AppState: ObservableObject {
                         role: .user,
                         content: "What is the meaning of life?"
                     )
-                ]
+                ],
+                stream_options: StreamOptions(include_usage: true)
             ) {
                 // publish at main event loop
                 DispatchQueue.main.async {
                     // parse the result content in structured form
                     // and stream back to the display
-                    self.displayText += res.choices[0].delta.content!.asText()
+                    if let finalUsage = res.usage {
+                        self.displayText += "\n" + (finalUsage.extra?.asTextLabel() ?? "")
+                    } else {
+                        self.displayText += res.choices[0].delta.content!.asText()
+                    }
                 }
             }
         }

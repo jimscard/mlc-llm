@@ -3,7 +3,9 @@
 import asyncio
 from typing import List
 
-from mlc_llm.serve import AsyncMLCEngine, EngineConfig, GenerationConfig
+from mlc_llm.protocol.generation_config import GenerationConfig
+from mlc_llm.serve import AsyncMLCEngine, EngineConfig
+from mlc_llm.testing import require_test_model
 
 prompts = [
     "What is the meaning of life?",
@@ -19,10 +21,12 @@ prompts = [
 ]
 
 
-async def test_engine_generate():
+@require_test_model(
+    "Llama-2-7b-chat-hf-q0f16-MLC",
+    "Llama-2-7b-chat-hf-q4f16_1-MLC",
+)
+async def test_engine_generate(model: str, small_model: str):
     # Create engine
-    model = "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC"
-    small_model = "HF://mlc-ai/Llama-2-7b-chat-hf-q4f16_1-MLC"
     async_engine = AsyncMLCEngine(
         model=model,
         mode="server",

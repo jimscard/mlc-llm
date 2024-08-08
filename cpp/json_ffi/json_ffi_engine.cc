@@ -29,8 +29,7 @@ bool JSONFFIEngine::ChatCompletion(std::string request_json_str, std::string req
 
 void JSONFFIEngine::StreamBackError(std::string request_id) {
   ChatCompletionMessage delta;
-  delta.content = std::vector<std::unordered_map<std::string, std::string>>{
-      {{"type", "text"}, {"text", this->err_}}};
+  delta.content = this->err_;
   delta.role = "assistant";
 
   ChatCompletionStreamResponseChoice choice;
@@ -46,6 +45,18 @@ void JSONFFIEngine::StreamBackError(std::string request_id) {
 
   picojson::array response_arr;
   response_arr.push_back(picojson::value(response.AsJSON()));
+
+  // now stream back the final usage block, which is required.
+  // NOTE: always stream back final usage block as it is an
+  // invariant of the system
+  response.choices.clear();
+  picojson::object dummy_usage;
+  dummy_usage["prompt_tokens"] = picojson::value(static_cast<int64_t>(0));
+  dummy_usage["completion_tokens"] = picojson::value(static_cast<int64_t>(0));
+  dummy_usage["total_tokens"] = picojson::value(static_cast<int64_t>(0));
+  response.usage = picojson::value(dummy_usage);
+  response_arr.push_back(picojson::value(response.AsJSON()));
+
   std::string stream_back_json = picojson::value(response_arr).serialize();
   this->request_stream_callback_(stream_back_json);
 }
@@ -57,28 +68,33 @@ bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request
     return false;
   }
   ChatCompletionRequest request = request_res.Unwrap();
-  // get prompt: note, assistant was appended in the end.
-  Result<std::vector<Data>> inputs_obj =
-      CreatePrompt(this->conv_template_, request, this->model_config_, this->device_);
-  if (inputs_obj.IsErr()) {
-    err_ = inputs_obj.UnwrapErr();
-    return false;
-  }
-  Array<Data> inputs = inputs_obj.Unwrap();
-
-  // generation_cfg
+  Array<Data> inputs;
   Array<String> stop_strs;
-  stop_strs.reserve(this->conv_template_.stop_str.size());
-  for (const std::string& stop_str : this->conv_template_.stop_str) {
-    stop_strs.push_back(stop_str);
-  }
-  if (request.stop.has_value()) {
-    stop_strs.reserve(stop_strs.size() + request.stop.value().size());
-    for (const std::string& stop_str : request.stop.value()) {
+  bool is_special_request =
+      (request.debug_config.has_value() &&
+       request.debug_config.value().special_request != SpecialRequestKind::kNone);
+  // special request does not have to go through prompt construction
+  if (!is_special_request) {
+    // get prompt: note, assistant was appended in the end.
+    Result<std::vector<Data>> inputs_obj =
+        CreatePrompt(this->conv_template_, request, this->model_config_, this->device_);
+    if (inputs_obj.IsErr()) {
+      err_ = inputs_obj.UnwrapErr();
+      return false;
+    }
+    inputs = inputs_obj.Unwrap();
+
+    stop_strs.reserve(this->conv_template_.stop_str.size());
+    for (const std::string& stop_str : this->conv_template_.stop_str) {
       stop_strs.push_back(stop_str);
     }
+    if (request.stop.has_value()) {
+      stop_strs.reserve(stop_strs.size() + request.stop.value().size());
+      for (const std::string& stop_str : request.stop.value()) {
+        stop_strs.push_back(stop_str);
+      }
+    }
   }
-
   // create a generation config from request
   const auto& default_gen_cfg = default_generation_config_;
   auto gen_cfg = tvm::runtime::make_object<GenerationConfigNode>();
@@ -91,26 +107,44 @@ bool JSONFFIEngine::AddRequest(std::string request_json_str, std::string request
   gen_cfg->logprobs = request.logprobs;
   gen_cfg->top_logprobs = request.top_logprobs;
   gen_cfg->logit_bias = request.logit_bias.value_or(default_gen_cfg->logit_bias);
-  gen_cfg->seed = request.seed.value_or(default_gen_cfg->seed);
-  gen_cfg->max_tokens = request.seed.value_or(default_gen_cfg->max_tokens);
+  gen_cfg->seed = request.seed.value_or(std::random_device{}());
+  gen_cfg->max_tokens = request.max_tokens.value_or(default_gen_cfg->max_tokens);
   gen_cfg->stop_strs = std::move(stop_strs);
   gen_cfg->stop_token_ids = conv_template_.stop_token_ids;
+  gen_cfg->response_format = request.response_format.value_or(ResponseFormat());
   gen_cfg->debug_config = request.debug_config.value_or(DebugConfig());
 
-  Request engine_request(request_id, inputs, GenerationConfig(gen_cfg));
-  this->engine_->AddRequest(engine_request);
+  Result<GenerationConfig> res_gen_config = GenerationConfig::Validate(GenerationConfig(gen_cfg));
+  if (res_gen_config.IsErr()) {
+    err_ = res_gen_config.UnwrapErr();
+    return false;
+  }
 
+  Request engine_request(request_id, inputs, res_gen_config.Unwrap());
+
+  // setup request state
+  RequestState rstate;
+  rstate.model = request.model.value_or("");
+  rstate.streamer.reserve(gen_cfg->n);
+  for (int i = 0; i < gen_cfg->n; ++i) {
+    rstate.streamer.push_back(TextStreamer(tokenizer_));
+  }
+  request_map_[request_id] = std::move(rstate);
+
+  this->engine_->AddRequest(engine_request);
   return true;
 }
 
 bool JSONFFIEngine::Abort(std::string request_id) {
   this->engine_->AbortRequest(request_id);
+  auto it = request_map_.find(request_id);
+  if (it != request_map_.end()) {
+    request_map_.erase(it);
+  }
   return true;
 }
 
 std::string JSONFFIEngine::GetLastError() { return err_; }
-
-std::string JSONFFIEngine::JSONMetrics() { return this->engine_->JSONMetrics(); }
 
 void JSONFFIEngine::ExitBackgroundLoop() { this->engine_->ExitBackgroundLoop(); }
 
@@ -126,7 +160,6 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
   TVM_MODULE_VTABLE_ENTRY("chat_completion", &JSONFFIEngineImpl::ChatCompletion);
   TVM_MODULE_VTABLE_ENTRY("abort", &JSONFFIEngineImpl::Abort);
   TVM_MODULE_VTABLE_ENTRY("get_last_error", &JSONFFIEngineImpl::GetLastError);
-  TVM_MODULE_VTABLE_ENTRY("json_metrics", &JSONFFIEngineImpl::JSONMetrics);
   TVM_MODULE_VTABLE_ENTRY("run_background_loop", &JSONFFIEngineImpl::RunBackgroundLoop);
   TVM_MODULE_VTABLE_ENTRY("run_background_stream_back_loop",
                           &JSONFFIEngineImpl::RunBackgroundStreamBackLoop);
@@ -169,10 +202,7 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
     this->conv_template_ = conv_template.Unwrap();
     this->model_config_ = ModelConfig::FromJSON(
         json::Lookup<picojson::object>(model_config_json_unwrapped, "model_config"));
-
-    // Create streamer.
-    // Todo(mlc-team): Create one streamer for each request, instead of a global one.
-    this->streamer_ = TextStreamer(Tokenizer::FromPath(engine_config->model));
+    this->tokenizer_ = Tokenizer::FromPath(engine_config->model);
   }
 
   void Unload() { this->engine_->Unload(); }
@@ -184,57 +214,84 @@ class JSONFFIEngineImpl : public JSONFFIEngine, public ModuleNode {
   void RunBackgroundStreamBackLoop() { this->engine_->RunBackgroundStreamBackLoop(); }
 
   String GetResponseFromStreamOutput(Array<RequestStreamOutput> delta_outputs) {
-    std::unordered_map<std::string, std::vector<ChatCompletionStreamResponseChoice>> response_map;
+    picojson::array json_response_arr;
     for (const auto& delta_output : delta_outputs) {
       std::string request_id = delta_output->request_id;
-      if (response_map.find(request_id) == response_map.end()) {
-        response_map[request_id] = std::vector<ChatCompletionStreamResponseChoice>();
-      }
-      ChatCompletionStreamResponseChoice choice;
+      auto request_state_it = request_map_.find(request_id);
+      if (request_state_it == request_map_.end()) continue;
+      RequestState& rstate = request_state_it->second;
 
-      if (delta_output->group_finish_reason.size() != 1) {
-        // Only support n = 1 in ChatCompletionStreamResponse for now
-        this->err_ += "Group finish reason should have exactly one element";
-      }
-      Optional<String> finish_reason = delta_output->group_finish_reason[0];
-      if (finish_reason.defined()) {
-        if (finish_reason.value() == "stop") {
-          choice.finish_reason = FinishReason::stop;
-        } else if (finish_reason.value() == "length") {
-          choice.finish_reason = FinishReason::length;
-        } else if (finish_reason.value() == "tool_calls") {
-          choice.finish_reason = FinishReason::tool_calls;
-        } else if (finish_reason.value() == "error") {
-          choice.finish_reason = FinishReason::error;
+      // build the final usage messages
+      // invariant, we can always let other messages to come first
+      // then the final usage messages, as final usage is always last
+      if (delta_output->request_final_usage_json_str.defined()) {
+        ChatCompletionStreamResponse response;
+        response.id = request_id;
+        response.model = rstate.model;
+        response.system_fingerprint = "";
+        std::string usage_json_str = delta_output->request_final_usage_json_str.value();
+        picojson::value usage_json;
+        std::string err = picojson::parse(usage_json, usage_json_str);
+        if (!err.empty()) {
+          err_ = err;
+        } else {
+          response.usage = usage_json;
         }
-      } else {
-        choice.finish_reason = std::nullopt;
+        json_response_arr.push_back(picojson::value(response.AsJSON()));
+        request_map_.erase(request_state_it);
+        continue;
       }
+      ICHECK_NE(delta_output->group_finish_reason.size(), 0);
+      ICHECK_EQ(delta_output->group_delta_token_ids.size(),
+                delta_output->group_finish_reason.size());
+      ICHECK_EQ(delta_output->group_delta_token_ids.size(), rstate.streamer.size());
 
-      choice.index = response_map[request_id].size();
-
-      ChatCompletionMessage delta;
-      // Size of delta_output->group_delta_token_ids Array should be 1
-      IntTuple delta_token_ids = delta_output->group_delta_token_ids[0];
-      std::vector<int32_t> delta_token_ids_vec(delta_token_ids.begin(), delta_token_ids.end());
-      delta.content = this->streamer_->Put(delta_token_ids_vec);
-      delta.role = "assistant";
-
-      choice.delta = delta;
-
-      response_map[request_id].push_back(choice);
-    }
-
-    picojson::array response_arr;
-    for (const auto& [request_id, choices] : response_map) {
       ChatCompletionStreamResponse response;
       response.id = request_id;
-      response.choices = choices;
-      response.model = "json_ffi";  // TODO: Return model name from engine (or from args)
+      response.model = rstate.model;
       response.system_fingerprint = "";
-      response_arr.push_back(picojson::value(response.AsJSON()));
+
+      for (size_t i = 0; i < delta_output->group_finish_reason.size(); ++i) {
+        // choice
+        ChatCompletionStreamResponseChoice choice;
+        Optional<String> finish_reason = delta_output->group_finish_reason[i];
+        if (finish_reason.defined()) {
+          if (finish_reason.value() == "stop") {
+            choice.finish_reason = FinishReason::stop;
+          } else if (finish_reason.value() == "length") {
+            choice.finish_reason = FinishReason::length;
+          } else if (finish_reason.value() == "tool_calls") {
+            choice.finish_reason = FinishReason::tool_calls;
+          } else if (finish_reason.value() == "error") {
+            choice.finish_reason = FinishReason::error;
+          }
+        } else {
+          choice.finish_reason = std::nullopt;
+        }
+        choice.index = static_cast<int>(i);
+        ChatCompletionMessage delta;
+        // Size of delta_output->group_delta_token_ids Array should be 1
+        const IntTuple& delta_token_ids = delta_output->group_delta_token_ids[i];
+        std::vector<int32_t> delta_token_ids_vec(delta_token_ids.begin(), delta_token_ids.end());
+        std::string content = rstate.streamer[i]->Put(delta_token_ids_vec);
+        if (finish_reason.defined()) {
+          content += rstate.streamer[i]->Finish();
+        }
+        if (!content.empty()) {
+          delta.content = content;
+        }
+        delta.role = "assistant";
+        choice.delta = delta;
+        if (!choice.delta.content.IsNull() || choice.finish_reason.has_value()) {
+          response.choices.push_back(choice);
+        }
+      }
+      // if it is not the usage block, choices cannot be empty
+      if (!response.choices.empty()) {
+        json_response_arr.push_back(picojson::value(response.AsJSON()));
+      }
     }
-    return picojson::value(response_arr).serialize();
+    return picojson::value(json_response_arr).serialize();
   }
 };
 

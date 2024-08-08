@@ -1,10 +1,10 @@
 # pylint: disable=chained-comparison,line-too-long,missing-docstring,
 # pylint: disable=too-many-arguments,too-many-locals,unused-argument,unused-variable
-from typing import List, Optional
+from typing import List
 
-import pytest
-
-from mlc_llm.serve import EngineConfig, GenerationConfig, MLCEngine
+from mlc_llm.protocol.generation_config import GenerationConfig
+from mlc_llm.serve import EngineConfig, MLCEngine
+from mlc_llm.testing import require_test_model
 
 prompts = [
     "What is the meaning of life?",
@@ -19,43 +19,17 @@ prompts = [
     "Do you know AlphaGo? What capabilities does it have, and what achievements has it got? Please elaborate in detail.",
 ]
 
-test_models = [
-    (
-        "HF://mlc-ai/Llama-2-7b-chat-hf-q0f16-MLC",
-        None,
-    ),
-    (
-        "dist/rwkv-6-world-1b6-q0f16-MLC",
-        "dist/rwkv-6-world-1b6-q0f16-MLC/rwkv-6-world-1b6-q0f16-MLC-cuda.so",
-    ),
-]
 
-
-def create_engine(model: str, model_lib: Optional[str]):
-    if "rwkv" in model:
-        return MLCEngine(
-            model=model,
-            model_lib=model_lib,
-            mode="server",
-            engine_config=EngineConfig(
-                max_num_sequence=8,
-                max_history_size=1,
-            ),
-        )
-    else:
-        return MLCEngine(
-            model=model,
-            model_lib=model_lib,
-            mode="server",
-            engine_config=EngineConfig(
-                max_total_sequence_length=4096,
-            ),
-        )
-
-
-@pytest.mark.parametrize("model,model_lib", test_models)
-def test_engine_generate(model: str, model_lib: Optional[str]):
-    engine = create_engine(model, model_lib)
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_engine_generate(model: str):
+    # Create engine
+    engine = MLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+        ),
+    )
 
     num_requests = 10
     max_tokens = 256
@@ -85,10 +59,16 @@ def test_engine_generate(model: str, model_lib: Optional[str]):
     del engine
 
 
-@pytest.mark.parametrize("model,model_lib", test_models)
-def test_chat_completion(model: str, model_lib: str):
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_chat_completion(model: str):
     # Create engine
-    engine = create_engine(model, model_lib)
+    engine = MLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+        ),
+    )
 
     num_requests = 2
     max_tokens = 64
@@ -107,6 +87,7 @@ def test_chat_completion(model: str, model_lib: str):
         ):
             for choice in response.choices:
                 assert choice.delta.role == "assistant"
+                assert isinstance(choice.delta.content, str)
                 output_texts[rid][choice.index] += choice.delta.content
 
     # Print output.
@@ -123,9 +104,16 @@ def test_chat_completion(model: str, model_lib: str):
     del engine
 
 
-@pytest.mark.parametrize("model,model_lib", test_models)
-def test_chat_completion_non_stream(model: str, model_lib: str):
-    engine = create_engine(model, model_lib)
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_chat_completion_non_stream(model: str):
+    # Create engine
+    engine = MLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+        ),
+    )
 
     num_requests = 2
     max_tokens = 64
@@ -143,6 +131,7 @@ def test_chat_completion_non_stream(model: str, model_lib: str):
         )
         for choice in response.choices:
             assert choice.message.role == "assistant"
+            assert isinstance(choice.message.content, str)
             output_texts[rid][choice.index] += choice.message.content
 
     # Print output.
@@ -159,9 +148,16 @@ def test_chat_completion_non_stream(model: str, model_lib: str):
     del engine
 
 
-@pytest.mark.parametrize("model,model_lib", test_models)
-def test_completion(model: str, model_lib: str):
-    engine = create_engine(model, model_lib)
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_completion(model: str):
+    # Create engine
+    engine = MLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+        ),
+    )
 
     num_requests = 2
     max_tokens = 128
@@ -175,9 +171,9 @@ def test_completion(model: str, model_lib: str):
             model=model,
             max_tokens=max_tokens,
             n=n,
-            ignore_eos=True,
             request_id=str(rid),
             stream=True,
+            extra_body={"debug_config": {"ignore_eos": True}},
         ):
             for choice in response.choices:
                 output_texts[rid][choice.index] += choice.text
@@ -196,9 +192,16 @@ def test_completion(model: str, model_lib: str):
     del engine
 
 
-@pytest.mark.parametrize("model,model_lib", test_models)
-def test_completion_non_stream(model: str, model_lib: str):
-    engine = create_engine(model, model_lib)
+@require_test_model("Llama-2-7b-chat-hf-q0f16-MLC")
+def test_completion_non_stream(model: str):
+    # Create engine
+    engine = MLCEngine(
+        model=model,
+        mode="server",
+        engine_config=EngineConfig(
+            max_total_sequence_length=4096,
+        ),
+    )
 
     num_requests = 2
     max_tokens = 128
@@ -212,8 +215,8 @@ def test_completion_non_stream(model: str, model_lib: str):
             model=model,
             max_tokens=max_tokens,
             n=n,
-            ignore_eos=True,
             request_id=str(rid),
+            extra_body={"debug_config": {"ignore_eos": True}},
         )
         for choice in response.choices:
             output_texts[rid][choice.index] += choice.text
@@ -233,9 +236,8 @@ def test_completion_non_stream(model: str, model_lib: str):
 
 
 if __name__ == "__main__":
-    for model, model_lib in test_models:
-        test_engine_generate(model, model_lib)
-        test_chat_completion(model, model_lib)
-        test_chat_completion_non_stream(model, model_lib)
-        test_completion(model, model_lib)
-        test_completion_non_stream(model, model_lib)
+    test_engine_generate()
+    test_chat_completion()
+    test_chat_completion_non_stream()
+    test_completion()
+    test_completion_non_stream()

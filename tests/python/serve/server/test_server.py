@@ -124,11 +124,12 @@ def check_openai_nonstream_response(
                 assert choice["finish_reason"] == "length"
 
     usage = response["usage"]
-    assert isinstance(usage, dict)
-    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-    assert usage["prompt_tokens"] > 0
-    if completion_tokens is not None:
-        assert usage["completion_tokens"] == completion_tokens
+    if usage is not None:
+        assert isinstance(usage, dict)
+        assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        assert usage["prompt_tokens"] > 0
+        if completion_tokens is not None:
+            assert usage["completion_tokens"] == completion_tokens
 
 
 def check_openai_stream_response(
@@ -180,14 +181,15 @@ def check_openai_stream_response(
 
         if not is_chat_completion:
             usage = response["usage"]
-            assert isinstance(usage, dict)
-            assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-            assert usage["prompt_tokens"] >= 0
-            if completion_tokens is not None:
-                assert usage["completion_tokens"] <= completion_tokens
+            if usage is not None:
+                assert isinstance(usage, dict)
+                assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+                assert usage["prompt_tokens"] >= 0
+                if completion_tokens is not None:
+                    assert usage["completion_tokens"] <= completion_tokens
 
     if not is_chat_completion:
-        if completion_tokens is not None:
+        if completion_tokens is not None and responses[-1]["usage"] is not None:
             assert responses[-1]["usage"]["completion_tokens"] == completion_tokens
 
     for i, (output, finish_reason) in enumerate(zip(outputs, finish_reason_list)):
@@ -256,7 +258,7 @@ def test_openai_v1_completions(
         "prompt": prompt,
         "max_tokens": max_tokens,
         "stream": stream,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -347,7 +349,7 @@ def test_openai_v1_completions_echo(
         "max_tokens": max_tokens,
         "echo": True,
         "stream": stream,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -398,7 +400,7 @@ def test_openai_v1_completions_suffix(
         "max_tokens": max_tokens,
         "suffix": suffix,
         "stream": stream,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -498,7 +500,7 @@ def test_openai_v1_completions_temperature(
         "max_tokens": max_tokens,
         "stream": stream,
         "temperature": 0.0,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -652,7 +654,7 @@ def test_openai_v1_completions_logit_bias(
         "max_tokens": max_tokens,
         "stream": stream,
         "logit_bias": {338: -100},  # 338 is " is" in Llama tokenizer.
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -699,7 +701,7 @@ def test_openai_v1_completions_presence_frequency_penalty(
         "stream": stream,
         "frequency_penalty": 2.0,
         "presence_penalty": 2.0,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -743,7 +745,7 @@ def test_openai_v1_completions_seed(
         "max_tokens": max_tokens,
         "stream": False,
         "seed": 233,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response1 = requests.post(OPENAI_V1_COMPLETION_URL, json=payload, timeout=180)
@@ -1207,7 +1209,7 @@ def test_openai_v1_chat_completions_ignore_eos(
         "messages": messages,
         "stream": stream,
         "max_tokens": max_tokens,
-        "ignore_eos": True,
+        "debug_config": {"ignore_eos": True},
     }
 
     response = requests.post(OPENAI_V1_CHAT_COMPLETION_URL, json=payload, timeout=180)

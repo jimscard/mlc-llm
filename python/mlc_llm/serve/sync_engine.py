@@ -13,8 +13,9 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import tvm
 
+from mlc_llm.protocol.generation_config import GenerationConfig
 from mlc_llm.serve import data
-from mlc_llm.serve.config import EngineConfig, GenerationConfig
+from mlc_llm.serve.config import EngineConfig
 from mlc_llm.serve.engine_base import (
     EngineMetrics,
     _check_engine_config,
@@ -25,9 +26,8 @@ from mlc_llm.serve.engine_base import (
 )
 from mlc_llm.serve.event_trace_recorder import EventTraceRecorder
 from mlc_llm.serve.request import Request
-from mlc_llm.streamer import TextStreamer
 from mlc_llm.support import logging
-from mlc_llm.tokenizer import Tokenizer
+from mlc_llm.tokenizers import TextStreamer, Tokenizer
 
 logging.enable_logging()
 logger = logging.getLogger(__name__)
@@ -97,7 +97,12 @@ class SyncMLCEngine:
         # - Check the fields fields of `engine_config`.
         if engine_config is None:
             engine_config = EngineConfig()
-        _check_engine_config(model, model_lib, mode, engine_config)
+        _check_engine_config(
+            model,
+            model_lib,
+            mode,
+            engine_config,
+        )
 
         # - Initialize model loading info.
         models = _parse_models(model, model_lib, engine_config.additional_models)
@@ -108,7 +113,7 @@ class SyncMLCEngine:
             model_args,
             model_config_paths,
             self.conv_template,
-        ) = _process_model_args(models, device)
+        ) = _process_model_args(models, device, engine_config)
 
         # - Load the raw model config into dict
         self.model_config_dicts = []
@@ -128,8 +133,8 @@ class SyncMLCEngine:
                 "add_request",
                 "abort_request",
                 "step",
-                "json_metrics",
                 "reset",
+                "json_metrics",
                 "get_request_stream_callback",
                 "set_request_stream_callback",
                 "create_request",
@@ -241,7 +246,7 @@ class SyncMLCEngine:
                         assert stream_output.delta_logprob_json_strs is not None
                         output_logprobs_str[rid][i] += stream_output.delta_logprob_json_strs
 
-                    delta_text = (
+                    delta_text = stream_output.extra_prefix_string + (
                         text_streamer.put(stream_output.delta_token_ids)
                         if len(stream_output.delta_token_ids) > 0
                         else ""
@@ -307,7 +312,9 @@ class SyncMLCEngine:
         """
         if not isinstance(inputs, list):
             inputs = [inputs]
-        self._ffi["create_request"](request_id, inputs, generation_config.asjson())
+        return self._ffi["create_request"](
+            request_id, inputs, generation_config.model_dump_json(by_alias=True)
+        )
 
     def add_request(self, request: Request) -> None:
         """Add a new request to the engine.
@@ -348,5 +355,5 @@ class SyncMLCEngine:
         self._ffi["reset"]()
 
     def metrics(self) -> EngineMetrics:
-        """The engine runtime metrics."""
+        """Reset the engine, clean up all running data and metrics."""
         return EngineMetrics(json.loads(self._ffi["json_metrics"]()))

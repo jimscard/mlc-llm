@@ -1,6 +1,6 @@
 /*!
  *  Copyright (c) 2023 by Contributors
- * \file serve/encoding.cc
+ * \file support/encoding.cc
  */
 #include "encoding.h"
 
@@ -64,6 +64,8 @@ std::string PrintAsEscaped(
   auto hex = ss.str();
   return std::string("\\") + prefix + hex;
 }
+
+std::string PrintAsEscaped(uint8_t raw_char) { return PrintAsEscaped(raw_char); }
 
 std::string PrintAsEscaped(std::string raw_str) {
   std::string res;

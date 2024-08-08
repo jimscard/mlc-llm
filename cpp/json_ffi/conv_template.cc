@@ -114,6 +114,12 @@ ModelConfig ModelConfig::FromJSON(const picojson::object& json_obj) {
     config.tensor_parallel_shards = tensor_parallel_shards_res.Unwrap();
   }
 
+  Result<int64_t> pipeline_parallel_stages_res =
+      json::LookupWithResultReturn<int64_t>(json_obj, "pipeline_parallel_stages");
+  if (pipeline_parallel_stages_res.IsOk()) {
+    config.pipeline_parallel_stages = pipeline_parallel_stages_res.Unwrap();
+  }
+
   Result<int64_t> max_batch_size_res =
       json::LookupWithResultReturn<int64_t>(json_obj, "max_batch_size");
   if (max_batch_size_res.IsOk()) {
@@ -250,11 +256,6 @@ Result<std::vector<Data>> CreatePrompt(const Conversation& conv,
   std::string pending_text =
       conv.GetSystemText(has_custom_system ? custom_system_inputs : conv.system_message);
 
-  // the seperator after system message.
-  if (!pending_text.empty()) {
-    pending_text += conv.seps[0];
-  }
-
   // Get the message strings
   std::vector<Data> message_list;
   size_t non_system_msg_count = 0;
@@ -360,6 +361,10 @@ Result<std::vector<Data>> CreatePrompt(const Conversation& conv,
   }
   if (pending_text.length() != 0) {
     message_list.push_back(TextData(pending_text));
+  }
+  // Handle system_prefix_token_ids
+  if (conv.system_prefix_token_ids.has_value()) {
+    message_list.insert(message_list.begin(), TokenData(conv.system_prefix_token_ids.value()));
   }
   return TResult::Ok(message_list);
 }

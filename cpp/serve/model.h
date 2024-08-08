@@ -190,13 +190,17 @@ class ModelObj : public Object {
    * \param embeddings The embedding of the input to be verified.
    * \param seq_id The id of the sequence in the KV cache.
    * \param lengths The length of each sequence to verify.
+   * \param token_tree_parent_ptr The parent pointers of the token tree.
+   * It's size is the sum of "lengths". It contains a batch of independent trees,
+   * one for each sequence. Parent being "-1" means the node is a root.
    * \return The logits for the draft token for each sequence in the batch.
    * \note The function runs for **every** sequence in the batch.
    * That is to say, it does not accept "running a verify step for a subset
    * of the full batch".
    */
   virtual NDArray BatchVerify(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
-                              const std::vector<int>& lengths) = 0;
+                              const std::vector<int>& lengths,
+                              const std::vector<int64_t>& token_tree_parent_ptr) = 0;
 
   /*!
    * \brief Batch verify function. Input hidden_states are computed from
@@ -204,6 +208,9 @@ class ModelObj : public Object {
    * \param hidden_states The hidden_states of the input to be verified.
    * \param seq_id The id of the sequence in the KV cache.
    * \param lengths The length of each sequence to verify.
+   * \param token_tree_parent_ptr The parent pointers of the token tree.
+   * It's size is the sum of "lengths". It contains a batch of independent trees,
+   * one for each sequence. Parent being "-1" means the node is a root.
    * \return The hidden_states for the draft token for each sequence in the batch.
    * \note The function runs for **every** sequence in the batch.
    * That is to say, it does not accept "running a verify step for a subset
@@ -211,7 +218,8 @@ class ModelObj : public Object {
    */
   virtual ObjectRef BatchVerifyToLastHidden(const ObjectRef& hidden_states,
                                             const std::vector<int64_t>& seq_ids,
-                                            const std::vector<int>& lengths) = 0;
+                                            const std::vector<int>& lengths,
+                                            const std::vector<int64_t>& token_tree_parent_ptr) = 0;
 
   /*********************** KV Cache Management  ***********************/
 
@@ -241,6 +249,14 @@ class ModelObj : public Object {
 
   /*! \brief Pop out N pages from KV cache. */
   virtual void PopNFromKVCache(int64_t seq_id, int num_tokens) = 0;
+
+  /*!
+   * \brief Commit the accepted token tree nodes to KV cache.
+   * The unaccepted token tree node will be removed from KV cache.
+   * This is usually used in the verification stage of speculative decoding.
+   */
+  virtual void CommitAcceptedTokenTreeNodesToKVCache(
+      const std::vector<int64_t>& seq_ids, const std::vector<int64_t>& accepted_leaf_indices) = 0;
 
   /*!
    * \brief Enabling sliding window for the given sequence.
@@ -352,19 +368,22 @@ class Model : public ObjectRef {
    * \param model_config The model config json object.
    * \param device The device to run the model on.
    * \param session The session to run the model on.
+   * \param num_shards The number of tensor parallel shards of the model.
+   * \param num_stages The number of pipeline parallel stages of the model.
    * \param trace_enabled A boolean indicating whether tracing is enabled.
    * \return The created runtime module.
    */
-  TVM_DLL static Model Create(String reload_lib_path, String model_path,
-                              const picojson::object& model_config, DLDevice device,
-                              const Optional<Session>& session, bool trace_enabled);
+  static Model Create(String reload_lib_path, String model_path,
+                      const picojson::object& model_config, DLDevice device,
+                      const Optional<Session>& session, int num_shards, int num_stages,
+                      bool trace_enabled);
 
   /*!
    * Load the model config from the given model path.
    * \param model_path The path to the model weight parameters.
    * \return The model config json object.
    */
-  TVM_DLL static Result<picojson::object> LoadModelConfig(const String& model_path);
+  static Result<picojson::object> LoadModelConfig(const String& model_path);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(Model, ObjectRef, ModelObj);
 };

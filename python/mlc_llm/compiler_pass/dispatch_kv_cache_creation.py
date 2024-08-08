@@ -1,5 +1,6 @@
 """A pass that rewrites KV cache creation functions in IRModule."""
 
+import json
 from typing import Any, Dict
 
 import tvm
@@ -20,13 +21,17 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:
     assert isinstance(args[0], relax.ExternFunc)
     assert args[0].global_symbol == "mlc.create_paged_kv_cache_generic"
 
-    assert len(args) == 11
+    assert len(args) == 13
     assert isinstance(args[1], relax.ShapeExpr)
     assert len(args[1].values) == 5
-    for i in range(2, 10):
+    assert isinstance(args[2], relax.ShapeExpr)
+    for i in range(3, 12):
+        if i == 10:
+            continue
         assert isinstance(args[i], relax.PrimValue)
         assert isinstance(args[i].value, (tvm.tir.IntImm, tvm.tir.FloatImm))
-    assert isinstance(args[10], relax.DataTypeImm)
+    assert isinstance(args[10], relax.StringImm)
+    assert isinstance(args[12], relax.DataTypeImm)
 
     return {
         "max_batch_size": args[1].values[0],
@@ -34,15 +39,17 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:
         "prefill_chunk_size": args[1].values[2],
         "page_size": args[1].values[3],
         "support_sliding_window": args[1].values[4],
-        "num_hidden_layers": args[2].value.value,
-        "num_attention_heads": args[3].value.value,
-        "num_key_value_heads": args[4].value.value,
-        "head_dim": args[5].value.value,
-        "rope_mode": args[6].value.value,
-        "rope_scale": args[7].value.value,
-        "rope_theta": args[8].value.value,
-        "rotary_dim": args[9].value.value,
-        "dtype": args[10].value,
+        "layer_partition": args[2],
+        "num_hidden_layers": args[3].value.value,
+        "num_attention_heads": args[4].value.value,
+        "num_key_value_heads": args[5].value.value,
+        "head_dim": args[6].value.value,
+        "rope_mode": args[7].value.value,
+        "rope_scale": args[8].value.value,
+        "rope_theta": args[9].value.value,
+        "rope_scaling": json.loads(args[10].value),
+        "rotary_dim": args[11].value.value,
+        "dtype": args[12].value,
     }
 
 
@@ -155,7 +162,7 @@ class DispatchKVCacheCreation:  # pylint: disable=too-many-instance-attributes
                 in self.metadata["model_type"]
             )
             # filter by attention group size
-            or kwargs["num_attention_heads"] // kwargs["num_key_value_heads"] not in [1, 4, 6, 8]
+            or kwargs["num_attention_heads"] // kwargs["num_key_value_heads"] not in [1, 4, 8]
         ):
             return
 

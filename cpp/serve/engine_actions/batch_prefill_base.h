@@ -25,6 +25,7 @@ class BatchPrefillBaseActionObj : public EngineActionObj {
     RequestStateEntry rsentry;
     int max_prefill_length = 0;
     int num_child_to_activate = 0;
+    bool is_decode = false;
   };
 
   BatchPrefillBaseActionObj(Array<Model> models, EngineConfig engine_config,
@@ -101,7 +102,7 @@ class BatchPrefillBaseActionObj : public EngineActionObj {
    * \param mstate The RequestModelState whose input data is to be concatenated.
    * \return The concatenate IntTuple.
    */
-  IntTuple GetConcatPrefillInputData(const RequestModelState& mstate);
+  std::vector<int32_t> GetConcatPrefillInputData(const RequestModelState& mstate);
 
   /*!
    * \brief Pop the prefix tokens of the RequestModelState input data array.
@@ -123,6 +124,8 @@ class BatchPrefillBaseActionObj : public EngineActionObj {
   Array<Model> models_;
   /*! \brief The engine config. */
   EngineConfig engine_config_;
+  /*! \brief The KV state kind. */
+  KVStateKind kv_state_kind_;
   /*! \brief The sliding window size of each model. */
   std::vector<int> sliding_window_sizes_;
   /*! \brief Event trace recorder. */

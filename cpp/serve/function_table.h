@@ -42,13 +42,13 @@ struct FunctionTable {
   static PackedFunc SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name);
 
   void Init(String reload_lib_path, Device device, picojson::object model_config,
-            Optional<Session> session);
+            Optional<Session> session, int num_shards, int num_stages);
 
   ObjectRef LoadParams(const std::string& model_path, Device device);
 
   void _InitFunctions();
 
-  ObjectRef Empty(ShapeTuple shape, DataType dtype, Device device) const;
+  ObjectRef Empty(ShapeTuple shape, DataType dtype, Device device, bool worker0_only) const;
 
   /*!
    * \brief Copy a host array to the worker or local gpu.
@@ -109,6 +109,7 @@ struct FunctionTable {
   PackedFunc kv_cache_begin_forward_func_;
   PackedFunc kv_cache_end_forward_func_;
   PackedFunc kv_cache_popn_func_;
+  PackedFunc kv_cache_commit_accepted_token_tree_nodes_func_;
   PackedFunc kv_cache_get_num_available_pages_func_;
   PackedFunc kv_cache_get_total_sequence_length_func_;
   PackedFunc gpu_multinomial_from_uniform_func_;
@@ -121,6 +122,7 @@ struct FunctionTable {
   PackedFunc nd_get_shape_func_;
   PackedFunc nd_copy_embedding_to_offset_func_;
   PackedFunc tuple_getitem_func_;
+  PackedFunc last_group_send_to_worker_0_;
   // Auxiliary functions for speculative decoding.
   PackedFunc gather_probs_func_;
   PackedFunc scatter_probs_func_;

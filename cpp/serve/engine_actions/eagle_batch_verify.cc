@@ -65,8 +65,10 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     Array<GenerationConfig> generation_cfg;
     std::vector<RandomGenerator*> rngs;
     std::vector<std::vector<SampleResult>> draft_output_tokens;
+    std::vector<int64_t> token_tree_parent_ptr;
     request_internal_ids.reserve(num_rsentries);
     all_tokens_to_verify.reserve(total_draft_length);
+    token_tree_parent_ptr.reserve(total_draft_length);
     verify_request_mstates.reserve(num_rsentries);
     rngs.reserve(num_rsentries);
     generation_cfg.reserve(num_rsentries);
@@ -81,11 +83,14 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       ICHECK_EQ(draft_lengths[i], draft_mstate->draft_output_tokens.size());
       ICHECK_EQ(draft_lengths[i], draft_mstate->draft_token_slots.size());
       // the last committed token + all the draft tokens but the last one.
-      all_tokens_to_verify.push_back(draft_mstate->committed_tokens.back().sampled_token_id.first);
+      all_tokens_to_verify.push_back(draft_mstate->committed_tokens.back().GetTokenId());
       draft_token_slots_.push_back(0);  // placeholder for the last committed token
+      token_tree_parent_ptr.push_back(-1);
+
       for (int j = 0; j < static_cast<int>(draft_mstate->draft_output_tokens.size()); ++j) {
-        all_tokens_to_verify.push_back(draft_mstate->draft_output_tokens[j].sampled_token_id.first);
+        all_tokens_to_verify.push_back(draft_mstate->draft_output_tokens[j].GetTokenId());
         draft_token_slots_.push_back(draft_mstate->draft_token_slots[j]);
+        token_tree_parent_ptr.push_back(draft_mstate->draft_token_parent_idx[j] + 1);
       }
       verify_request_mstates.push_back(verify_mstate);
       generation_cfg.push_back(rsentries[i]->request->generation_cfg);
@@ -113,7 +118,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
 
     RECORD_EVENT(trace_recorder_, request_ids, "start verify");
     ObjectRef hidden_states = models_[verify_model_id_]->BatchVerifyToLastHidden(
-        embeddings, request_internal_ids, verify_lengths);
+        embeddings, request_internal_ids, verify_lengths, token_tree_parent_ptr);
     NDArray logits = models_[verify_model_id_]->GetLogits(hidden_states);
     RECORD_EVENT(trace_recorder_, request_ids, "finish verify");
     ICHECK_EQ(logits->ndim, 2);
@@ -126,6 +131,11 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     // - Compute probability distributions.
     NDArray probs_on_device = logit_processor_->ComputeProbsFromLogits(
         logits, generation_cfg, request_ids, &cum_verify_lengths);
+
+    // - Commit the prefix cache changes from previous round of action.
+    // Note: we commit prefix cache changes here to overlap this commit with the GPU execution.
+    estate->prefix_cache->CommitSequenceExtention();
+
     std::vector<int> sample_indices(num_rsentries);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     NDArray renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
@@ -133,7 +143,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     std::vector<std::vector<SampleResult>> sample_results_arr =
         sampler_->BatchVerifyDraftTokensWithProbAfterTopP(
             renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
-            draft_output_tokens, draft_probs_on_device);
+            draft_output_tokens, token_tree_parent_ptr, draft_probs_on_device);
     ICHECK_EQ(sample_results_arr.size(), num_rsentries);
 
     // We collect the requests whose drafts are fully accepted.
@@ -141,7 +151,11 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     // by the draft model but not added into the draft model's KV cache.
     // In this case, an additional batch decode step is needed for these requests.
     std::vector<int64_t> fully_accepted_rsentries;
+    std::vector<int64_t> verify_model_seq_internal_ids;
+    std::vector<int64_t> accepted_token_tree_leaf_nodes;
     fully_accepted_rsentries.reserve(num_rsentries);
+    verify_model_seq_internal_ids.reserve(num_rsentries);
+    accepted_token_tree_leaf_nodes.reserve(num_rsentries);
 
     std::vector<int> last_accepted_hidden_positions;
     last_accepted_hidden_positions.reserve(num_rsentries);
@@ -155,7 +169,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       }
       // Metrics update
       // live update the output metrics
-      rsentries[i]->rstate->metrics.num_output_tokens += accept_length;
+      rsentries[i]->rstate->metrics.completion_tokens += accept_length;
       estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
                                          accept_length);
       // - Minus one because the last draft token has no kv cache entry
@@ -163,12 +177,13 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       int rollback_length =
           std::max(cum_verify_lengths[i + 1] - cum_verify_lengths[i] - accept_length, 0);
 
-      // rollback kv cache
+      // Commit accepted tokens to the "verify_model", rollback kv cache
+      // in the "draft_model".
       // NOTE: when number of small models is more than 1 (in the future),
       // it is possible to re-compute prefill for the small models.
+      verify_model_seq_internal_ids.push_back(rsentries[i]->mstates[verify_model_id_]->internal_id);
+      accepted_token_tree_leaf_nodes.push_back(accept_length - 1);
       if (rollback_length > 0) {
-        models_[verify_model_id_]->PopNFromKVCache(
-            rsentries[i]->mstates[verify_model_id_]->internal_id, rollback_length);
         // Draft model rollback minus one because verify uses one more token.
         models_[draft_model_id_]->PopNFromKVCache(
             rsentries[i]->mstates[draft_model_id_]->internal_id, rollback_length - 1);
@@ -181,6 +196,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       // - Slice and save hidden_states_for_sample
       last_accepted_hidden_positions.push_back(cum_verify_lengths[i] + accept_length - 1);
     }
+    models_[verify_model_id_]->CommitAcceptedTokenTreeNodesToKVCache(
+        verify_model_seq_internal_ids, accepted_token_tree_leaf_nodes);
     if (!fully_accepted_rsentries.empty() &&
         engine_config_->speculative_mode == SpeculativeMode::kEagle) {
       // - Run a step of batch decode for requests whose drafts are fully accepted.
@@ -204,7 +221,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
         input_tokens.push_back(rsentries[rsentry_id]
                                    ->mstates[verify_model_id_]
                                    ->committed_tokens[num_committed_tokens - 2]
-                                   .sampled_token_id.first);
+                                   .GetTokenId());
 
         // Taking the hidden states of the token before the last token
         hidden_states_positions_for_fully_accepted.push_back(
@@ -256,7 +273,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       }
       for (int i = 0; i < num_rsentries; ++i) {
         ICHECK(!mstates[i]->committed_tokens.empty());
-        input_tokens.push_back(mstates[i]->committed_tokens.back().sampled_token_id.first);
+        input_tokens.push_back(mstates[i]->committed_tokens.back().GetTokenId());
       }
 
       Array<NDArray> multi_step_logits{nullptr};  // for medusa output
@@ -288,20 +305,25 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       std::iota(sample_indices.begin(), sample_indices.end(), 0);
 
       if (engine_config_->speculative_mode == SpeculativeMode::kEagle) {
-        const auto& [renormalized_probs, sample_results] =
-            ApplyLogitProcessorAndSample(logit_processor_, sampler_, logits, generation_cfg,
-                                         request_ids, mstates, rngs, sample_indices);
+        const auto& [renormalized_probs, sample_results] = ApplyLogitProcessorAndSample(
+            logit_processor_, sampler_, logits, generation_cfg, request_ids, mstates, rngs,
+            sample_indices, generation_cfg, request_ids, sample_indices);
         UpdateRequestStatesWithDraftProposals(mstates, sample_results, draft_model_id_,
                                               renormalized_probs, hidden_states, estate);
       } else if (engine_config_->speculative_mode == SpeculativeMode::kMedusa) {
         for (int draft_id = 0; draft_id < engine_config_->spec_draft_length; draft_id++) {
           const auto& [renormalized_probs, sample_results] = ApplyLogitProcessorAndSample(
               logit_processor_, sampler_, multi_step_logits[draft_id], generation_cfg, request_ids,
-              mstates, rngs, sample_indices);
+              mstates, rngs, sample_indices, generation_cfg, request_ids, sample_indices);
           UpdateRequestStatesWithDraftProposals(mstates, sample_results, draft_model_id_,
                                                 renormalized_probs, hidden_states, estate);
         }
       }
+    }
+    // reset num_tokens_for_next_decode
+    for (const RequestStateEntry& rsentry : rsentries) {
+      rsentry->mstates[verify_model_id_]->num_tokens_for_next_decode = 0;
+      rsentry->mstates[draft_model_id_]->num_tokens_for_next_decode = 0;
     }
     auto tend = std::chrono::high_resolution_clock::now();
     double elapsed_time = static_cast<double>((tend - tstart).count()) / 1e9;
@@ -334,7 +356,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     int num_available_pages = models_[verify_model_id_]->GetNumAvailablePages();
 
     // Preempt the request state entries that cannot fit the large model for verification.
-    std::vector<RequestStateEntry> running_rsentries = GetRunningRequestStateEntries(estate);
+    std::vector<RequestStateEntry> running_rsentries = estate->GetRunningRequestStateEntries();
     std::vector<int> num_page_requirement;
     num_page_requirement.reserve(running_rsentries.size());
     for (const RequestStateEntry& rsentry : running_rsentries) {
@@ -381,7 +403,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
                                       &model_workspaces_[0].draft_hidden_states_storage);
     }
     for (int i = 0; i < static_cast<int>(mstates.size()); ++i) {
-      mstates[i]->AddDraftToken(sample_results[i], draft_token_slots_[i]);
+      int64_t parent_idx = static_cast<int64_t>(mstates[i]->draft_output_tokens.size()) - 1;
+      mstates[i]->AddDraftToken(sample_results[i], draft_token_slots_[i], parent_idx);
     }
   }
   /*!

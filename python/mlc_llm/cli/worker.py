@@ -16,6 +16,7 @@
 # under the License.
 # pylint: disable=invalid-name
 """Internal DiscoWorker for Disco ProcessSession."""
+
 import os
 import sys
 
@@ -24,26 +25,32 @@ from tvm._ffi import get_global_func
 
 from .. import base  # pylint: disable=unused-import, no-name-in-module
 
+# register the calibration functions
+from ..interface import calibrate  # pylint: disable=unused-import
+
 
 def main():
     """Main worker function"""
-    if len(sys.argv) != 5:
-        print("Usage: <worker_id> <num_workers> <read_fd> <write_fd>")
+    if len(sys.argv) != 6:
+        print("Usage: <worker_id> <num_workers> <num_groups> <read_fd> <write_fd>")
         return
 
     worker_id = int(sys.argv[1])
     num_workers = int(sys.argv[2])
+    num_groups = int(sys.argv[3])
+    read_fd = int(sys.argv[4])
+    write_fd = int(sys.argv[5])
     if sys.platform == "win32":
         import msvcrt  # pylint: disable=import-outside-toplevel,import-error
 
-        reader = msvcrt.open_osfhandle(int(sys.argv[3]), os.O_BINARY)
-        writer = msvcrt.open_osfhandle(int(sys.argv[4]), os.O_BINARY)
+        reader = msvcrt.open_osfhandle(read_fd, os.O_BINARY)
+        writer = msvcrt.open_osfhandle(write_fd, os.O_BINARY)
     else:
-        reader = int(sys.argv[3])
-        writer = int(sys.argv[4])
+        reader = read_fd
+        writer = write_fd
 
     worker_func = get_global_func("runtime.disco.WorkerProcess")
-    worker_func(worker_id, num_workers, reader, writer)
+    worker_func(worker_id, num_workers, num_groups, reader, writer)
 
 
 if __name__ == "__main__":

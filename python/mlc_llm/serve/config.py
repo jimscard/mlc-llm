@@ -2,139 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple, Union
-
-
-@dataclass
-class ResponseFormat:
-    """The response format dataclass.
-
-    Parameters
-    ----------
-    type : Literal["text", "json_object"]
-        The type of response format. Default: "text".
-
-    schema : Optional[str]
-        The JSON schema string for the JSON response format. If None, a legal json string without
-        special restrictions will be generated.
-
-        Could be specified when the response format is "json_object". Default: None.
-    """
-
-    type: Literal["text", "json_object"] = "text"
-    schema: Optional[str] = None
-
-    def __post_init__(self):
-        if self.schema is not None and self.type != "json_object":
-            raise ValueError("JSON schema is only supported in JSON response format")
-
-
-@dataclass
-class DebugConfig:
-    """The debug configuration dataclass.Parameters
-    ----------
-
-    pinned_system_prompt : bool
-        Whether the input and generated data pinned in engine. Default is set to False.
-        This can be used for system prompt or other purpose, if the data is aimed to be
-        kept all the time.
-    """
-
-    pinned_system_prompt: bool = False
-
-
-@dataclass
-class GenerationConfig:  # pylint: disable=too-many-instance-attributes
-    """The generation configuration dataclass.
-
-    Parameters
-    ----------
-    n : int
-        How many chat completion choices to generate for each input message.
-
-    temperature : Optional[float]
-        The value that applies to logits and modulates the next token probabilities.
-
-    top_p : Optional[float]
-        In sampling, only the most probable tokens with probabilities summed up to
-        `top_p` are kept for sampling.
-
-    frequency_penalty : Optional[float]
-        Positive values penalize new tokens based on their existing frequency
-        in the text so far, decreasing the model's likelihood to repeat the same
-        line verbatim.
-
-    presence_penalty : Optional[float]
-        Positive values penalize new tokens based on whether they appear in the text
-        so far, increasing the model's likelihood to talk about new topics.
-
-    repetition_penalty : float
-        The penalty term that applies to logits to control token repetition in generation.
-        It will be suppressed when any of frequency_penalty and presence_penalty is
-        non-zero.
-
-    logprobs : bool
-        Whether to return log probabilities of the output tokens or not.
-        If true, the log probabilities of each output token will be returned.
-
-    top_logprobs : int
-        An integer between 0 and 5 specifying the number of most likely
-        tokens to return at each token position, each with an associated
-        log probability.
-        `logprobs` must be set to True if this parameter is used.
-
-    logit_bias : Optional[Dict[int, float]]
-        The bias logit value added to selected tokens prior to sampling.
-
-    max_tokens : Optional[int]
-        The maximum number of generated tokens,
-        or None, in which case the generation will not stop
-        until exceeding model capability or hit any stop criteria.
-
-    seed : Optional[int]
-        The random seed of the generation.
-        The seed will be a random value if not specified.
-
-    stop_strs : List[str]
-        The list of strings that mark the end of generation.
-
-    stop_token_ids : List[int]
-        The list of token ids that mark the end of generation.
-
-    response_format : ResponseFormat
-        The response format of the generation output.
-
-    debug_config : Optional[DebugConfig]
-        The optional debug configuration.
-    """
-
-    n: int = 1
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    presence_penalty: Optional[float] = None
-    repetition_penalty: float = 1.0
-    logprobs: bool = False
-    top_logprobs: int = 0
-    logit_bias: Optional[Dict[int, float]] = field(default_factory=dict)
-
-    max_tokens: Optional[int] = 128
-    seed: Optional[int] = None
-    stop_strs: List[str] = field(default_factory=list)
-    stop_token_ids: List[int] = field(default_factory=list)
-
-    response_format: ResponseFormat = field(default_factory=ResponseFormat)
-
-    debug_config: Optional[DebugConfig] = field(default_factory=DebugConfig)
-
-    def asjson(self) -> str:
-        """Return the config in string of JSON format."""
-        return json.dumps(asdict(self))
-
-    @staticmethod
-    def from_json(json_str: str) -> "GenerationConfig":
-        """Construct a config from JSON string."""
-        return GenerationConfig(**json.loads(json_str))
+from typing import List, Literal, Optional, Tuple, Union
 
 
 @dataclass
@@ -176,7 +44,13 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
         You can manually specify arguments "max_num_sequence", "max_total_sequence_length" and
         "prefill_chunk_size" to override the automatic inferred values.
 
-    gpu_memory_utilization : float
+    tensor_parallel_shards : Optional[int]
+        Number of shards to split the model into in tensor parallelism multi-gpu inference.
+
+    pipeline_parallel_stages : Optional[int]
+        Number of pipeline stages to split the model layers for pipeline parallelism.
+
+    gpu_memory_utilization : Optional[float]
         A number in (0, 1) denoting the fraction of GPU memory used by the server in total.
         It is used to infer to maximum possible KV cache capacity.
         When it is unspecified, it defaults to 0.85.
@@ -201,8 +75,14 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     prefill_chunk_size : Optional[int]
         The maximum total sequence length in a prefill.
 
+    sliding_window_size : Optional[int]
+        The sliding window size in sliding window attention (SWA).
+
+    attention_sink_size : Optional[int]
+        The number of attention sinks when sliding window is enabled..
+
     max_history_size: Optional[int]
-        The maximum history size for RNN state to rool back.
+        The maximum history size for RNN state to roll back.
 
     kv_state_kind: Optional[Literal["kv_cache", "rnn_state"]]
         The kind of cache.
@@ -226,6 +106,12 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
         The maximum number of recycling sequences in prefix cache, default as max_num_sequence.
         And set 0 to disable prefix cache, set -1 to have infinite capacity prefix cache.
 
+    prefill_mode : Literal["chunked", "hybrid"]
+        The prefill mode.
+        "chunked" means the basic prefill with chunked input enabled.
+        "hybrid" means the hybrid prefill or split-fuse,
+        so that decode step will be converted into prefill.
+
     verbose : bool
         A boolean indicating whether to print logging info in engine.
     """
@@ -234,18 +120,23 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     model_lib: Optional[str] = None
     additional_models: List[Union[str, Tuple[str, str]]] = field(default_factory=list)
     mode: Optional[Literal["local", "interactive", "server"]] = None
+    tensor_parallel_shards: Optional[int] = None
+    pipeline_parallel_stages: Optional[int] = None
     gpu_memory_utilization: Optional[float] = None
     kv_cache_page_size: int = 16
     max_num_sequence: Optional[int] = None
     max_total_sequence_length: Optional[int] = None
     max_single_sequence_length: Optional[int] = None
     prefill_chunk_size: Optional[int] = None
+    sliding_window_size: Optional[int] = None
+    attention_sink_size: Optional[int] = None
     max_history_size: Optional[int] = None
     kv_state_kind: Optional[Literal["kv_cache", "rnn_state"]] = None
     speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"] = "disable"
     spec_draft_length: int = 4
     prefix_cache_mode: Literal["disable", "radix"] = "radix"
     prefix_cache_max_num_recycling_seqs: Optional[int] = None
+    prefill_mode: Literal["chunked", "hybrid"] = "hybrid"
     verbose: bool = True
 
     def asjson(self) -> str:

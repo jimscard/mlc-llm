@@ -12,10 +12,10 @@
 
 #include <optional>
 
-#include "../streamer.h"
+#include "../grammar/grammar_state_matcher.h"
 #include "../support/random.h"
+#include "../tokenizers/streamer.h"
 #include "config.h"
-#include "grammar/grammar_state_matcher.h"
 #include "metrics.h"
 #include "request.h"
 
@@ -54,11 +54,16 @@ class RequestModelStateNode : public Object {
   /*! \brief The list of input data yet for the model to prefill. */
   Array<Data> inputs;
   /*! \brief The list of prefilled input data, used to notify prefix cache. */
-  Array<Data> prefilled_inputs;
+  std::vector<Data> prefilled_inputs;
   /*! \brief The number of tokens already cached in prefix cache. */
   int64_t cached_committed_tokens = 0;
   /*! \brief The number of tokens that is already prefilled from the inputs. */
   int64_t num_prefilled_tokens = 0;
+  /*! \brief The number of tokens that need to be processed in the next decoding. */
+  int num_tokens_for_next_decode = 0;
+  /*! \brief Whether retokenization is needed in the next decoding. When the jump-forward decoding
+   * is enabled, retokenization is needed after every jump-forward and decoding action. */
+  bool require_retokenization_in_next_decode = false;
 
   // NOTE: The following fields are reserved for future speculative inference
   // settings, and are produced by the speculative small models.
@@ -71,6 +76,8 @@ class RequestModelStateNode : public Object {
   std::vector<SampleResult> draft_output_tokens;
   /*! \brief The storage slots for the associated states of draft tokens. */
   std::vector<int> draft_token_slots;
+  /*! \brief The parent indices of the draft tokens. */
+  std::vector<int64_t> draft_token_parent_idx;
   /*! \brief The appeared committed and draft tokens and their occurrence times. */
   std::unordered_map<int32_t, int32_t> appeared_token_ids;
 
@@ -93,10 +100,15 @@ class RequestModelStateNode : public Object {
    * with dtype uint32_t and shape (ceildiv(vocab_size, 32),).
    */
   void FindNextTokenBitmask(DLTensor* bitmask);
-  /*! \brief Commit a new token into committed_tokens. Update appeared_token_ids. */
+  /*! \brief Commit a new token into committed_tokens. Does not effect the kv cache. Update
+   * appeared_token_ids and the grammar state. */
   void CommitToken(SampleResult sampled_token);
+  /*! \brief Roll back the last tokens back from committed_tokens. Does not effect the kv cache.
+   * Also roll back appeared_token_ids and the grammar state. */
+  void RollbackTokens(int count);
+
   /*! \brief Add a draft token into draft_output_tokens. Update appeared_token_ids. */
-  void AddDraftToken(SampleResult sampled_token, int draft_token_slot);
+  void AddDraftToken(SampleResult sampled_token, int draft_token_slot, int64_t parent_idx);
   /*! \brief Remove all draft tokens from draft_output_tokens. Update appeared_token_ids. */
   void RemoveAllDraftTokens(std::vector<int>* removed_draft_token_slots = nullptr);
 
@@ -120,9 +132,12 @@ class RequestModelState : public ObjectRef {
 };
 
 struct DeltaRequestReturn {
-  std::vector<int32_t> delta_token_ids;
-  Array<String> delta_logprob_json_strs;
+  std::vector<int64_t> delta_token_ids;
+  std::vector<String> delta_logprob_json_strs;
   Optional<String> finish_reason;
+  /*! \brief The extra string to prepend the delta output. The delta output should be
+   * extra_prefix_string + detokenize(delta_token_ids). */
+  String extra_prefix_string = "";
 };
 
 /****************** Request States ******************/
@@ -159,6 +174,13 @@ enum class RequestStateStatus : int {
   kPending = 0,
   kAlive = 1,
   kFinished = 2,
+};
+
+/*! \brief The data structures for each request used in the action post-process. */
+struct RequestActionPostProcWorkspace {
+  std::vector<RequestStreamOutput> stream_outputs;
+
+  RequestStreamOutput GetStreamOutput();
 };
 
 // forward declare request state node.
@@ -198,6 +220,11 @@ class RequestStateEntryNode : public Object {
    */
   int next_callback_token_pos;
 
+  /*! \brief The extra string to prepend the output. */
+  std::string extra_prefix_string;
+
+  std::vector<int32_t> token_ids_for_prefix_cache_update;
+
   /*!
    * \brief Back reference to the request state.
    * Use ObjectRef to avoid circulate reference.
@@ -208,13 +235,18 @@ class RequestStateEntryNode : public Object {
    * \brief Get the delta token ids and the logprob JSON strings for this request to return since
    * the last time calling into this function, and return the finish reason if the request
    * generation has finished.
+   * \note This function follows the destination passing style, which means it writes the
+   * output into the "idx"-th slot in "delta_stream_output".
+   * We adopt the destination passing style to reduce the CPU data structure allocation and
+   * construction overhead.
    * \param tokenizer The tokenizer for logprob process.
    * \param max_single_sequence_length The maximum allowed single sequence length.
-   * \return The delta token ids to return, the logprob JSON strings of each delta token id, and
-   * the optional finish reason.
+   * \param delta_stream_output The delta token ids to return, the logprob JSON strings
+   * of each delta token id, and the optional finish reason.
+   * \param idx The index denoting which slot to write results in "delta_request_return".
    */
-  DeltaRequestReturn GetReturnTokenIds(const Tokenizer& tokenizer,
-                                       int64_t max_single_sequence_length);
+  void GetDeltaRequestReturn(const Tokenizer& tokenizer, int64_t max_single_sequence_length,
+                             RequestStreamOutput* delta_stream_output, int idx);
 
   static constexpr const char* _type_key = "mlc.serve.RequestStateEntry";
   static constexpr const bool _type_has_method_sequal_reduce = false;
@@ -236,10 +268,15 @@ class RequestStateEntry : public ObjectRef {
 /*! \brief A request's state, which groups all the request state entries. */
 class RequestStateNode : public Object {
  public:
-  /*! \brief the reuqest state entries */
+  /*! \brief the request state entries */
   std::vector<RequestStateEntry> entries;
   /*! \brief tracks the request metrics. */
   RequestMetrics metrics;
+  /*!
+   * \brief The post-process data structures.
+   * We make it a state to avoid repetitive memory allocation/free in the action post process.
+   */
+  RequestActionPostProcWorkspace postproc_states;
 
   static constexpr const char* _type_key = "mlc.serve.RequestState";
   static constexpr const bool _type_has_method_sequal_reduce = false;
@@ -249,7 +286,12 @@ class RequestStateNode : public Object {
 
 class RequestState : public ObjectRef {
  public:
-  explicit RequestState(std::vector<RequestStateEntry> entries,
+  /*!
+   * \brief Request state constructor. We take the number of response (namely "n" in OpenAI
+   * API) to pre-allocate all the data structure, in order to reduce the CPU data structure
+   * allocation overhead when updating the request state.
+   */
+  explicit RequestState(std::vector<RequestStateEntry> entries, int num_response,
                         std::chrono::high_resolution_clock::time_point add_time_point);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestState, ObjectRef, RequestStateNode);

@@ -66,6 +66,7 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
       int cum_prefill_length = 0;
       bool single_input =
           num_rsentries == 1 && prefill_inputs[0].rsentry->mstates[model_id]->inputs.size() == 1;
+      std::vector<int64_t> cached_token_data;
       for (int i = 0; i < num_rsentries; ++i) {
         const RequestStateEntry& rsentry = prefill_inputs[i].rsentry;
         RequestModelState mstate = rsentry->mstates[model_id];
@@ -99,16 +100,37 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
         }
         request_internal_ids.push_back(mstate->internal_id);
         RECORD_EVENT(trace_recorder_, rsentry->request->id, "start embedding");
-        for (int i = 0; i < static_cast<int>(input_data.size()); ++i) {
-          if (!model_id) {
-            mstate->prefilled_inputs.push_back(input_data[i]);
+        for (int j = 0; j < static_cast<int>(input_data.size()); ++j) {
+          if (!model_id && !prefill_inputs[i].is_decode) {
+            mstate->prefilled_inputs.push_back(input_data[j]);
           }
-          embeddings = input_data[i]->GetEmbedding(models_[model_id],
-                                                   /*dst=*/!single_input ? &embeddings : nullptr,
-                                                   /*offset=*/cum_prefill_length);
-          cum_prefill_length += input_data[i]->GetLength();
+          if (const auto* token_data = input_data[j].as<TokenDataNode>()) {
+            cached_token_data.insert(cached_token_data.end(), token_data->token_ids.begin(),
+                                     token_data->token_ids.end());
+          } else {
+            if (!cached_token_data.empty()) {
+              embeddings = TokenData(cached_token_data)
+                               ->GetEmbedding(models_[model_id],
+                                              /*dst=*/!single_input ? &embeddings : nullptr,
+                                              /*offset=*/cum_prefill_length);
+              cum_prefill_length += cached_token_data.size();
+              cached_token_data.clear();
+            }
+            embeddings = input_data[j]->GetEmbedding(models_[model_id],
+                                                     /*dst=*/!single_input ? &embeddings : nullptr,
+                                                     /*offset=*/cum_prefill_length);
+            cum_prefill_length += input_data[j]->GetLength();
+          }
         }
         RECORD_EVENT(trace_recorder_, rsentry->request->id, "finish embedding");
+      }
+      if (!cached_token_data.empty()) {
+        embeddings = TokenData(cached_token_data)
+                         ->GetEmbedding(models_[model_id],
+                                        /*dst=*/!single_input ? &embeddings : nullptr,
+                                        /*offset=*/cum_prefill_length);
+        cum_prefill_length += cached_token_data.size();
+        cached_token_data.clear();
       }
 
       RECORD_EVENT(trace_recorder_, request_ids, "start prefill");
@@ -143,6 +165,10 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
     // - Compute probability distributions.
     NDArray probs_on_device =
         logit_processor_->ComputeProbsFromLogits(logits_for_sample, generation_cfg, request_ids);
+
+    // - Commit the prefix cache changes from previous round of action.
+    // Note: we commit prefix cache changes here to overlap this commit with the GPU execution.
+    estate->prefix_cache->CommitSequenceExtention();
 
     // - Sample tokens.
     //   For rsentries which have children, sample
@@ -230,6 +256,7 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
 
     std::vector<Request> processed_requests =
         RemoveProcessedRequests(prefill_inputs, estate, rstates_of_entries);
+    estate->running_rsentries_changed = true;
     return processed_requests;
   }
 
@@ -255,8 +282,8 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
     }
     if (rsentry->parent_idx == -1 && rsentry->status == RequestStateStatus::kPending &&
         !estate->prefix_cache->HasSequence(rsentry->mstates[0]->internal_id)) {
-      IntTuple tokens = GetConcatPrefillInputData(rsentry->mstates[0]);
-      if (!tokens.size()) {
+      std::vector<int32_t> tokens = GetConcatPrefillInputData(rsentry->mstates[0]);
+      if (tokens.empty()) {
         // If the RequestStateEntry is of empty input data, or not fully tokenized, do nothing
         // and return.
         return;
@@ -272,7 +299,10 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
         CHECK_EQ(result.reused_seq_pop_last_tokens, 0);
         for (Model model : models_) {
           model->AddNewSequence(rsentry->mstates[0]->internal_id);
-          model->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+          // Enable sliding window for the sequence if it is not a parent.
+          if (rsentry->child_indices.empty()) {
+            model->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+          }
         }
       } else {
         if (result.forked_seq_id != -1) {
@@ -282,7 +312,10 @@ class NewRequestPrefillActionObj : public BatchPrefillBaseActionObj {
           for (Model model : models_) {
             model->ForkSequence(result.forked_seq_id, rsentry->mstates[0]->internal_id,
                                 result.prefilled_offset);
-            model->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+            // Enable sliding window for the sequence if it is not a parent.
+            if (rsentry->child_indices.empty()) {
+              model->EnableSlidingWindowForSeq(rsentry->mstates[0]->internal_id);
+            }
           }
         } else {
           // Reuse recycling sequence

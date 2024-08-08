@@ -7,6 +7,9 @@ import tvm.testing
 
 from mlc_llm.op.tree_attn import tree_attn
 
+# test category "op_correctness"
+pytestmark = [pytest.mark.op_correctness]
+
 
 @pytest.mark.parametrize("nbatch", [1, 4, 32])
 @pytest.mark.parametrize("h_q", [8, 16])
@@ -104,7 +107,7 @@ def test_tree_attn(nbatch, h_q, h_kv, d, rotary_mode):
     v_tvm = tvm.nd.array(v, dev)
     kv_indptr_tvm = tvm.nd.array(kv_indptr, dev)
     q_rope_position_tvm = tvm.nd.array(q_rope_position, dev)
-    m_arr_tvm = tvm.nd.array(m_arr, dev)
+    # m_arr_tvm = tvm.nd.array(m_arr, dev)
     mn_indptr_tvm = tvm.nd.array(mn_indptr, dev)
     mask_tvm = tvm.nd.array(mask, dev)
     output_tvm = tvm.nd.array(output, dev)
@@ -120,7 +123,7 @@ def test_tree_attn(nbatch, h_q, h_kv, d, rotary_mode):
         v_tvm,
         kv_indptr_tvm,
         q_rope_position_tvm,
-        m_arr_tvm,
+        # m_arr_tvm,
         mn_indptr_tvm,
         mask_tvm,
         output_tvm,
@@ -129,6 +132,7 @@ def test_tree_attn(nbatch, h_q, h_kv, d, rotary_mode):
         rotary_scale,
         rotary_theta,
         attn_score_scaling_factor,
+        nbatch,
     )
 
     ### Numpy reference
@@ -232,7 +236,7 @@ def test_tree_attn(nbatch, h_q, h_kv, d, rotary_mode):
         rotary_scale,
         rotary_theta,
         attn_score_scaling_factor,
-        output_tvm.asnumpy(),
+        output_tvm.numpy(),
     )
 
 

@@ -32,33 +32,64 @@ class MistralConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
     position_embedding_base: int = 0
     num_key_value_heads: int = 0
     head_dim: int = 0
-    sliding_window_size: int = 4096
+    context_window_size: int = 0
+    sliding_window_size: int = 0
     prefill_chunk_size: int = 0
     attention_sink_size: int = 4
     tensor_parallel_shards: int = 1
     max_batch_size: int = 1
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self):  # pylint: disable=too-many-branches
         if self.position_embedding_base == 0:
             if "rope_theta" in self.kwargs:
                 self.position_embedding_base = self.kwargs.pop("rope_theta")
             else:
                 self.position_embedding_base = 10000
+        if self.sliding_window_size == 0:
+            self.sliding_window_size = self.kwargs.pop("sliding_window", -1)
+        if self.sliding_window_size is None:
+            # Sliding window is disabled.
+            self.sliding_window_size = -1
+        if self.context_window_size == 0:
+            if self.sliding_window_size == -1:
+                for name in ["max_position_embeddings", "max_sequence_length"]:
+                    if name in self.kwargs:
+                        self.context_window_size = self.kwargs.pop(name)
+                        logger.info(
+                            "%s not found in config.json. Falling back to %s (%d)",
+                            bold("context_window_size"),
+                            bold(name),
+                            self.context_window_size,
+                        )
+                        break
+                else:
+                    raise ValueError(
+                        "Unable to determine the maximum sequence length, because none of "
+                        "`context_window_size`, `max_position_embeddings` or "
+                        "`max_sequence_length` is provided in `config.json`."
+                    )
+            else:
+                self.context_window_size = -1
+
         if self.num_key_value_heads == 0:
             self.num_key_value_heads = self.num_attention_heads
         if self.head_dim == 0:
             self.head_dim = self.hidden_size // self.num_attention_heads
         assert self.num_attention_heads % self.num_key_value_heads == 0
-        assert self.head_dim * self.num_attention_heads == self.hidden_size
         assert self.attention_sink_size >= 0
         if self.prefill_chunk_size == 0:
+            prefill_chunk_size_candidates = []
+            if self.sliding_window_size != -1:
+                prefill_chunk_size_candidates.append(self.sliding_window_size)
+            if self.context_window_size != -1:
+                prefill_chunk_size_candidates.append(self.context_window_size)
             logger.info(
                 "%s defaults to %d",
                 bold("prefill_chunk_size"),
-                min(self.sliding_window_size, 2048),
+                min(*prefill_chunk_size_candidates, 2048),
             )
-            self.prefill_chunk_size = min(self.sliding_window_size, 2048)
+            self.prefill_chunk_size = min(*prefill_chunk_size_candidates, 2048)
 
 
 # pylint: disable=invalid-name,missing-docstring
@@ -69,6 +100,11 @@ class MistralMLP(nn.Module):
 
     def __init__(self, config: MistralConfig):
         super().__init__()
+        if config.intermediate_size % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split MLP intermediate size {config.intermediate_size} "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
         self.gate_up_proj = nn.Linear(
             in_features=config.hidden_size,
@@ -88,6 +124,11 @@ class MistralAttention(nn.Module):  # pylint: disable=too-many-instance-attribut
 
     def __init__(self, config: MistralConfig):
         self.head_dim = config.head_dim
+        if config.num_key_value_heads % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split {config.num_key_value_heads} key-value attention heads "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.num_q_heads = config.num_attention_heads // config.tensor_parallel_shards
         self.num_kv_heads = config.num_key_value_heads // config.tensor_parallel_shards
         self.qkv_proj = nn.Linear(

@@ -16,12 +16,17 @@ endif (NOT DEFINED TVM_SOURCE_DIR)
 message(STATUS "TVM_SOURCE_DIR: ${TVM_SOURCE_DIR}")
 
 find_package(Java REQUIRED)
-find_package(JNI REQUIRED)
-if (JNI_FOUND)
-    message (STATUS "JNI_INCLUDE_DIRS=${JNI_INCLUDE_DIRS}")
-    message (STATUS "JNI_LIBRARIES=${JNI_LIBRARIES}")
-endif()
 include(UseJava)
+
+find_package(JNI)
+if (JNI_FOUND)
+  message (STATUS "JNI_INCLUDE_DIRS=${JNI_INCLUDE_DIRS}")
+else()
+  message (STATUS "Try to find jni directly from android env")
+  # try to find JNI_LIBRARY
+  find_path(JNI_INCLUDE_DIRS NAMES "jni.h")
+  message (STATUS "JNI_INCLUDE_DIRS=${JNI_INCLUDE_DIRS}")
+endif()
 
 
 file(GLOB_RECURSE javasources
@@ -40,6 +45,7 @@ add_library(model_android STATIC IMPORTED)
 set_target_properties(model_android PROPERTIES IMPORTED_LOCATION ${ANDROID_BIN_DIR}/lib/libmodel_android.a)
 
 add_library(tvm4j_runtime_packed SHARED ${TVM_SOURCE_DIR}/jvm/native/src/main/native/org_apache_tvm_native_c_api.cc)
+set(MLC_LLM_COMPILE_DEFS ${MLC_LLM_COMPILE_DEFS} TVM_SOURCE_DIR=${TVM_SOURCE_DIR})
 
 target_include_directories(tvm4j_runtime_packed PUBLIC
   ${JNI_INCLUDE_DIRS}
@@ -47,16 +53,20 @@ target_include_directories(tvm4j_runtime_packed PUBLIC
   ${ANDROID_DIR}/src/cpp
   ${TVM_SOURCE_DIR}/3rdparty/dlpack/include
   ${TVM_SOURCE_DIR}/3rdparty/dmlc-core/include
+  ${TVM_SOURCE_DIR}/3rdparty/OpenCL-Headers
+  ${TVM_SOURCE_DIR}/3rdparty/picojson
   ${TVM_SOURCE_DIR}/include
+  ${TVM_SOURCE_DIR}/src
 )
+target_compile_definitions(tvm4j_runtime_packed PUBLIC ${MLC_LLM_COMPILE_DEFS})
+target_compile_definitions(tvm4j_runtime_packed PUBLIC TVM_RELAX_VM_ENABLE_PROFILER=0)
 
+set(MLC_ENABLE_SENTENCEPIECE_TOKENIZER OFF)
 target_link_libraries(tvm4j_runtime_packed
-  sentencepiece-static
   tokenizers_c
   tokenizers_cpp
   log
   -Wl,--whole-archive
-  tvm_runtime
   mlc_llm_static
   model_android
   -Wl,--no-whole-archive
@@ -64,6 +74,8 @@ target_link_libraries(tvm4j_runtime_packed
 
 target_compile_definitions(tvm4j_runtime_packed PUBLIC TVM4J_ANDROID)
 add_dependencies(tvm4j_runtime_packed tvm4j_core)
+
+target_compile_definitions(mlc_llm_objs PUBLIC MLC_SINGLE_GPU_ONLY)
 
 install_jar(tvm4j_core output)
 install(TARGETS tvm4j_runtime_packed LIBRARY DESTINATION output/${ANDROID_ABI})

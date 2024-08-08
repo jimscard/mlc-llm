@@ -7,25 +7,29 @@
 
 #include <dlpack/dlpack.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/runtime/memory/memory_manager.h>
 #include <tvm/runtime/module.h>
+#include <tvm/runtime/nvtx.h>
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/runtime/threading_backend.h>
 
+#include <cstdlib>
 #include <functional>
 #include <numeric>
 #include <optional>
 #include <tuple>
 #include <unordered_set>
 
+#include "../grammar/grammar_state_matcher.h"
 #include "../support/json_parser.h"
 #include "../support/result.h"
-#include "../tokenizers.h"
+#include "../support/utils.h"
+#include "../tokenizers/tokenizers.h"
 #include "engine_actions/action.h"
 #include "engine_actions/action_commons.h"
 #include "engine_state.h"
 #include "event_trace_recorder.h"
-#include "grammar/grammar_state_matcher.h"
 #include "logit_processor.h"
 #include "model.h"
 #include "request.h"
@@ -41,6 +45,234 @@ using namespace tvm::runtime;
 
 class EngineModule;
 
+// get tokenizer info from model config
+inline std::optional<TokenizerInfo> GetTokenizerInfo(const picojson::object& model_config) {
+  if (model_config.count("tokenizer_info") == 0) {
+    LOG(WARNING) << "Tokenizer info not found in mlc-chat-config.json. "
+                 << "Trying to automatically detect the tokenizer info";
+    return std::nullopt;
+  }
+  const picojson::object& tokenizer_info_obj =
+      model_config.at("tokenizer_info").get<picojson::object>();
+  auto info = make_object<TokenizerInfoNode>();
+  if (tokenizer_info_obj.count("token_postproc_method")) {
+    info->token_postproc_method = tokenizer_info_obj.at("token_postproc_method").get<std::string>();
+  }
+  if (tokenizer_info_obj.count("prepend_space_in_encode")) {
+    info->prepend_space_in_encode = tokenizer_info_obj.at("prepend_space_in_encode").get<bool>();
+  }
+  if (tokenizer_info_obj.count("strip_space_in_decode")) {
+    info->strip_space_in_decode = tokenizer_info_obj.at("strip_space_in_decode").get<bool>();
+  }
+  return TokenizerInfo(info);
+}
+
+inline std::pair<std::optional<std::string>, int> GetEnvSocketHostPort() {
+  char* host_str = std::getenv("MLC_SOCKET_HOST");
+  char* port_str = std::getenv("MLC_SOCKET_PORT");
+  if (host_str == nullptr || port_str == nullptr) {
+    return {std::nullopt, -1};
+  }
+  std::string host(host_str);
+  if (host.empty()) {
+    return {std::nullopt, -1};
+  }
+  return {host, std::atoi(port_str)};
+}
+
+/*!
+ *  \brief This a mock engine that always echo back the inputs
+ *   and attaches the generation config to usage.extra
+ *
+ * \note: mock engine test cannot replace real engine test.
+ *
+ * It only tests that parameters are converted and
+ * passed correctly to the backend.
+ */
+class MockEchoEngineImpl : public Engine {
+ public:
+  static Result<EngineCreationOutput> Create(const std::string& engine_config_json_str,
+                                             FRequestStreamCallback request_stream_callback,
+                                             const picojson::object& model_config) {
+    using TResult = Result<EngineCreationOutput>;
+    // set dummy values
+    InferrableEngineConfig inferrable_config;
+    inferrable_config.max_num_sequence = 32;
+    inferrable_config.max_total_sequence_length = 32 * 4096;
+    inferrable_config.max_single_sequence_length = 4096;
+    inferrable_config.prefill_chunk_size = 1024;
+    inferrable_config.max_history_size = 1024;
+    picojson::value config_json;
+    std::string err = picojson::parse(config_json, engine_config_json_str);
+    if (!err.empty()) {
+      return TResult::Error(err);
+    }
+    EngineConfig engine_config = EngineConfig::FromJSONAndInferredConfig(
+        config_json.get<picojson::object>(), inferrable_config);
+
+    auto n = std::make_unique<MockEchoEngineImpl>();
+    n->request_stream_callback_ = request_stream_callback;
+    n->tokenizer_ = Tokenizer::FromPath(engine_config->model, GetTokenizerInfo(model_config));
+    // - Get the default generation config from the first model.
+    GenerationConfig default_generation_cfg =
+        GenerationConfig::GetDefaultFromModelConfig(model_config);
+    return TResult::Ok({std::move(n), std::move(engine_config), std::move(default_generation_cfg)});
+  }
+
+  void Reset() final {}
+
+  bool Empty() final { return request_map_.empty(); }
+
+  void SetRequestStreamCallback(FRequestStreamCallback request_stream_callback) final {
+    request_stream_callback_ = request_stream_callback;
+  }
+
+  FRequestStreamCallback GetRequestStreamCallback() final { return request_stream_callback_; }
+
+  void AddRequest(Request request) final {
+    // precompute the stream back results and store them in the request_map
+    request = Request::FromUntokenized(request, tokenizer_);
+    std::vector<RequestStreamOutput> outputs;
+    int64_t completion_tokens = 0;
+    int64_t prompt_tokens = 0;
+
+    for (Data input : request->inputs) {
+      // only stream back token data
+      if (auto* token_data = input.as<TokenDataNode>()) {
+        for (int64_t token_id : token_data->token_ids) {
+          prompt_tokens += 1;
+          completion_tokens += 1;
+          if (request->generation_cfg->max_tokens == -1 ||
+              completion_tokens <= request->generation_cfg->max_tokens) {
+            outputs.push_back(RequestStreamOutput(
+                request->id,
+                std::vector<std::vector<int64_t>>(request->generation_cfg->n, {token_id}),
+                std::nullopt, std::vector<Optional<String>>(request->generation_cfg->n, NullOpt),
+                std::vector<String>(request->generation_cfg->n)));
+          }
+        }
+      }
+    }
+
+    // output go beyond max tokens
+    String finish_reason = "stop";
+    if (request->generation_cfg->max_tokens != -1 &&
+        prompt_tokens > request->generation_cfg->max_tokens) {
+      finish_reason = "length";
+    }
+    std::vector<std::vector<int64_t>> group_delta_token_ids;
+
+    // correct the last output with right finish reason
+    if (outputs.size() > 0) {
+      group_delta_token_ids = outputs.back()->group_delta_token_ids;
+      outputs.pop_back();
+    }
+    outputs.push_back(RequestStreamOutput(
+        request->id, group_delta_token_ids, std::nullopt,
+        std::vector<Optional<String>>(request->generation_cfg->n, finish_reason),
+        std::vector<String>(request->generation_cfg->n)));
+
+    // attach usage and config
+    picojson::object usage;
+    usage["prompt_tokens"] = picojson::value(static_cast<int64_t>(prompt_tokens));
+    usage["completion_tokens"] =
+        picojson::value(static_cast<int64_t>(completion_tokens * request->generation_cfg->n));
+    usage["total_tokens"] = picojson::value(
+        static_cast<int64_t>(prompt_tokens + completion_tokens * request->generation_cfg->n));
+    usage["extra"] = picojson::value(request->generation_cfg->AsJSON());
+    // NOTE: Invariant requirement
+    // always stream back final usage
+    // otherwise frontend may have issues deciding termination
+    outputs.push_back(RequestStreamOutput::Usage(request->id, picojson::value(usage).serialize()));
+    // reverse the stream back so we can just pop back and get out
+    std::reverse(outputs.begin(), outputs.end());
+
+    request_map_[request->id] = MockRequestState{request, std::move(outputs)};
+  }
+
+  void AbortRequest(const String& request_id) {
+    auto it = request_map_.find(request_id);
+    if (it == request_map_.end()) return;
+    Request request = it->second.request;
+
+    // If the request input length exceeds the maximum allowed single sequence length,
+    // invoke callback and do not process the request.
+    Array<RequestStreamOutput> output{RequestStreamOutput(
+        request_id, std::vector<std::vector<int64_t>>(request->generation_cfg->n), std::nullopt,
+        std::vector<Optional<String>>(request->generation_cfg->n, String("abort")),
+        std::vector<String>(request->generation_cfg->n))};
+    // NOTE: Invariant requirement
+    // always stream back final usage
+    // otherwise frontend may have issues deciding
+    String dummy_usage =
+        ("{ \"prompt_tokens\": 0, \"completion_tokens\": 0, \"total_tokens\": 0 }");
+    output.push_back(RequestStreamOutput::Usage(request->id, dummy_usage));
+    request_map_.erase(it);
+    if (request_stream_callback_ != nullptr) {
+      request_stream_callback_(output);
+    }
+  }
+
+  void AbortAllRequests() final {
+    // avoid deletion during iteraton
+    std::vector<String> request_ids;
+    for (const auto& kv : request_map_) {
+      request_ids.push_back(kv.first);
+    }
+    for (String req_id : request_ids) {
+      AbortRequest(req_id);
+    }
+  }
+
+  void Step() final {
+    Array<RequestStreamOutput> outputs;
+    std::vector<String> finished_request_ids;
+    for (auto& kv : request_map_) {
+      MockRequestState& state = kv.second;
+      ICHECK_GE(state.reversed_outputs.size(), 2);
+      if (state.reversed_outputs.size() == 2) {
+        outputs.push_back(state.reversed_outputs.back());
+        state.reversed_outputs.pop_back();
+        outputs.push_back(state.reversed_outputs.back());
+        finished_request_ids.push_back(kv.first);
+      } else {
+        outputs.push_back(state.reversed_outputs.back());
+        state.reversed_outputs.pop_back();
+      }
+    }
+    for (String req_id : finished_request_ids) {
+      request_map_.erase(req_id);
+    }
+    if (request_stream_callback_ != nullptr) {
+      request_stream_callback_(outputs);
+    }
+  }
+
+  /************** Debug/Profile **************/
+
+  /*! \brief Internal engine metrics. */
+  String JSONMetrics() final { return "{}"; }
+
+  /*! \brief Call the given global function on all workers. Only for debug purpose. */
+  void DebugCallFuncOnAllAllWorker(const String& func_name) final {}
+
+ private:
+  struct MockRequestState {
+    Request request;
+    std::vector<RequestStreamOutput> reversed_outputs;
+  };
+
+  // internal tokenizer
+  // keep for future usage, in case we want to echo back the tokens
+  Tokenizer tokenizer_;
+  // callback stream
+  FRequestStreamCallback request_stream_callback_;
+  // active requests
+  std::unordered_map<String, MockRequestState> request_map_;
+};
+
+/********************** Engine Impl **********************/
+
 /*! \brief The implementation of Engine. */
 class EngineImpl : public Engine {
   friend class EngineModule;
@@ -50,7 +282,7 @@ class EngineImpl : public Engine {
 
   static Result<EngineCreationOutput> Create(const std::string& engine_config_json_str,
                                              DLDevice device,
-                                             Optional<PackedFunc> request_stream_callback,
+                                             FRequestStreamCallback request_stream_callback,
                                              Optional<EventTraceRecorder> trace_recorder) {
     using TResult = Result<EngineCreationOutput>;
     std::unique_ptr<EngineImpl> n = std::make_unique<EngineImpl>();
@@ -63,7 +295,9 @@ class EngineImpl : public Engine {
     }
     std::vector<std::pair<std::string, std::string>> models_and_model_libs =
         models_and_model_libs_res.Unwrap();
-    ICHECK_GE(models_and_model_libs.size(), 1);
+
+    int num_model = models_and_model_libs.size();
+    ICHECK_GE(num_model, 1);
     // - Initialize singleton states inside the engine.
     n->estate_->Reset();
     n->request_stream_callback_ = std::move(request_stream_callback);
@@ -71,22 +305,35 @@ class EngineImpl : public Engine {
     n->device_ = device;
     // - Load model config, create a shared disco session when tensor
     // parallelism is enabled.
+    std::vector<std::string> model_libs;
     std::vector<picojson::object> model_configs;
-    for (int i = 0; i < static_cast<int>(models_and_model_libs.size()); ++i) {
+    model_libs.reserve(num_model);
+    model_configs.reserve(num_model);
+    for (int i = 0; i < num_model; ++i) {
       const auto& [model_str, model_lib] = models_and_model_libs[i];
       Result<picojson::object> model_config_res = Model::LoadModelConfig(model_str);
       if (model_config_res.IsErr()) {
         return TResult::Error("Model " + std::to_string(i) +
                               " has invalid mlc-chat-config.json: " + model_config_res.UnwrapErr());
       }
+      model_libs.push_back(model_lib);
       model_configs.push_back(model_config_res.Unwrap());
     }
-    Optional<Session> session = n->CreateDiscoSession(model_configs, device);
+
+    // kick in mock path so we don't have to load in models
+    if (models_and_model_libs[0].second == "mock://echo") {
+      return MockEchoEngineImpl::Create(engine_config_json_str, n->request_stream_callback_,
+                                        model_configs[0]);
+    }
+
+    auto [session, num_shards, model_num_pipeline_stages] =
+        n->CreateDiscoSession(model_libs, model_configs, device);
     // - Initialize each model independently.
     n->models_.clear();
-    for (int i = 0; i < static_cast<int>(models_and_model_libs.size()); ++i) {
+    for (int i = 0; i < num_model; ++i) {
       const auto& [model_str, model_lib] = models_and_model_libs[i];
       Model model = Model::Create(model_lib, model_str, model_configs[i], device, session,
+                                  num_shards, model_num_pipeline_stages[i],
                                   /*trace_enabled=*/trace_recorder.defined());
       n->models_.push_back(model);
     }
@@ -112,6 +359,13 @@ class EngineImpl : public Engine {
         LOG(FATAL) << "Unsupported prefix cache mode: "
                    << static_cast<int>(engine_config->prefix_cache_mode);
       }
+      if (engine_config->speculative_mode != SpeculativeMode::kDisable &&
+          engine_config->prefill_mode == PrefillMode::kHybrid) {
+        engine_config->prefill_mode = PrefillMode::kChunked;
+        LOG(WARNING)
+            << "Hybrid prefill mode fallbacks to chunked prefill, due to speculative mode is "
+               "enabled and not implemented with hybrid prefill yet.";
+      }
     }
     // - Load model weights, create KV cache and workspace.
     n->model_workspaces_.clear();
@@ -126,17 +380,8 @@ class EngineImpl : public Engine {
           ModelWorkspace{model->AllocEmbeddingTensor(), model->AllocHiddenStatesTensor()});
     }
     // - Initialize tokenizer and grammar
-    n->tokenizer_ = Tokenizer::FromPath(engine_config->model);
-    std::string token_table_postproc_method;
-    if (model_configs[0].count("token_table_postproc_method") == 0) {
-      // Backward compatibility: use "byte_fallback" by default
-      token_table_postproc_method = "byte_fallback";
-    } else {
-      token_table_postproc_method =
-          model_configs[0].at("token_table_postproc_method").get<std::string>();
-    }
-    n->token_table_ =
-        Tokenizer::PostProcessTokenTable(n->tokenizer_->TokenTable(), token_table_postproc_method);
+    n->tokenizer_ = Tokenizer::FromPath(engine_config->model, GetTokenizerInfo(model_configs[0]));
+    n->token_table_ = n->tokenizer_->PostProcessedTokenTable();
     n->grammar_init_context_cache_ = GrammarInitContextCache(n->token_table_);
     // - Create the logit processor and sampler, and
     // the DraftTokenWorkspaceManager for speculative decoding.
@@ -161,21 +406,21 @@ class EngineImpl : public Engine {
       ICHECK_GT(n->models_.size(), 1U);
       switch (engine_config->speculative_mode) {
         case SpeculativeMode::kEagle:
-          n->actions_ = {
-              EngineAction::EagleNewRequestPrefill(n->models_,                     //
-                                                   logit_processor,                //
-                                                   sampler,                        //
-                                                   n->model_workspaces_,           //
-                                                   draft_token_workspace_manager,  //
-                                                   engine_config,                  //
-                                                   model_configs,                  //
-                                                   n->trace_recorder_),
-              EngineAction::EagleBatchDraft(n->models_, logit_processor, sampler,
-                                            n->model_workspaces_, draft_token_workspace_manager,
-                                            n->trace_recorder_, engine_config->spec_draft_length),
-              EngineAction::EagleBatchVerify(n->models_, logit_processor, sampler,
-                                             n->model_workspaces_, draft_token_workspace_manager,
-                                             engine_config, n->trace_recorder_)};
+          n->actions_ = {EngineAction::EagleNewRequestPrefill(n->models_,                     //
+                                                              logit_processor,                //
+                                                              sampler,                        //
+                                                              n->model_workspaces_,           //
+                                                              draft_token_workspace_manager,  //
+                                                              engine_config,                  //
+                                                              model_configs,                  //
+                                                              n->trace_recorder_),
+                         EngineAction::EagleBatchDraft(
+                             n->models_, logit_processor, sampler, n->model_workspaces_,
+                             draft_token_workspace_manager, engine_config, n->trace_recorder_,
+                             engine_config->spec_draft_length),
+                         EngineAction::EagleBatchVerify(
+                             n->models_, logit_processor, sampler, n->model_workspaces_,
+                             draft_token_workspace_manager, engine_config, n->trace_recorder_)};
           break;
         case SpeculativeMode::kMedusa:
           n->actions_ = {EngineAction::EagleNewRequestPrefill(n->models_,                     //
@@ -200,22 +445,23 @@ class EngineImpl : public Engine {
                                               model_configs,         //
                                               n->trace_recorder_),
               EngineAction::BatchDraft(n->models_, logit_processor, sampler, n->model_workspaces_,
-                                       draft_token_workspace_manager, n->trace_recorder_,
-                                       engine_config->spec_draft_length),
+                                       draft_token_workspace_manager, engine_config,
+                                       n->trace_recorder_, engine_config->spec_draft_length),
               EngineAction::BatchVerify(n->models_, logit_processor, sampler, n->model_workspaces_,
                                         draft_token_workspace_manager, engine_config,
                                         n->trace_recorder_)};
       }
     } else {
-      n->actions_ = {
-          EngineAction::NewRequestPrefill(n->models_,            //
-                                          logit_processor,       //
-                                          sampler,               //
-                                          n->model_workspaces_,  //
-                                          engine_config,         //
-                                          model_configs,         //
-                                          n->trace_recorder_),
-          EngineAction::BatchDecode(n->models_, logit_processor, sampler, n->trace_recorder_)};
+      n->actions_ = {EngineAction::NewRequestPrefill(n->models_,            //
+                                                     logit_processor,       //
+                                                     sampler,               //
+                                                     n->model_workspaces_,  //
+                                                     engine_config,         //
+                                                     model_configs,         //
+                                                     n->trace_recorder_),
+                     EngineAction::BatchJumpForward(n->models_, n->tokenizer_, n->trace_recorder_),
+                     EngineAction::BatchDecode(n->models_, n->tokenizer_, logit_processor, sampler,
+                                               engine_config, n->trace_recorder_)};
     }
     // - Automatically set the threading backend max concurrency.
     n->engine_config_ = engine_config;
@@ -236,33 +482,67 @@ class EngineImpl : public Engine {
 
   bool Empty() final { return estate_->request_states.empty(); }
 
-  String JSONMetrics() final { return estate_->metrics.AsJSON().serialize(true); }
+  String JSONMetrics() final { return picojson::value(estate_->metrics.AsJSON()).serialize(true); }
 
-  Optional<PackedFunc> GetRequestStreamCallback() final { return request_stream_callback_; }
+  FRequestStreamCallback GetRequestStreamCallback() final { return request_stream_callback_; }
 
-  void SetRequestStreamCallback(Optional<PackedFunc> request_stream_callback) final {
+  void SetRequestStreamCallback(FRequestStreamCallback request_stream_callback) final {
     request_stream_callback_ = std::move(request_stream_callback);
+  }
+
+  // string back error node
+  void StreamBackError(Request request, String finish_reason) {
+    // If the request input length exceeds the maximum allowed single sequence length,
+    // invoke callback and do not process the request.
+    Array<RequestStreamOutput> output{RequestStreamOutput(
+        request->id, std::vector<std::vector<int64_t>>(request->generation_cfg->n), std::nullopt,
+        std::vector<Optional<String>>(request->generation_cfg->n, finish_reason),
+        std::vector<String>(request->generation_cfg->n))};
+    // NOTE: Invariant requirement
+    // always stream back final usage
+    // otherwise frontend may have issues deciding
+    String dummy_usage =
+        ("{ \"prompt_tokens\": 0, \"completion_tokens\": 0, \"total_tokens\": 0 }");
+    output.push_back(RequestStreamOutput::Usage(request->id, dummy_usage));
+    if (request_stream_callback_ != nullptr) {
+      request_stream_callback_(output);
+    }
   }
 
   /***************** High-level Request Management *****************/
 
+  void HandleSpecialRequests(Request request) {
+    auto special_request = request->generation_cfg->debug_config.special_request;
+    switch (special_request) {
+      case SpecialRequestKind::kQueryEngineMetrics: {
+        Array<RequestStreamOutput> output = {
+            RequestStreamOutput::Usage(request->id, estate_->metrics.AsUsageJSONStr())};
+        request_stream_callback_(output);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
   void AddRequest(Request request) final {
+    NVTXScopedRange nvtx_scope("Add request " + request->id);
+    // special requests do not involve generation
+    if (request->generation_cfg->debug_config.special_request != SpecialRequestKind::kNone) {
+      this->HandleSpecialRequests(request);
+      return;
+    }
+
     RECORD_EVENT(trace_recorder_, request->id, "request added to engine");
     auto add_time_point = std::chrono::high_resolution_clock::now();
 
     // Get a request copy where all text inputs are tokenized.
     request = Request::FromUntokenized(request, tokenizer_);
-    ICHECK_NE(request->num_input_tokens, -1);
+    ICHECK_NE(request->prompt_tokens, -1);
 
-    if (request->num_input_tokens >= engine_config_->max_single_sequence_length &&
-        request_stream_callback_.defined()) {
-      // If the request input length exceeds the maximum allowed single sequence length,
-      // invoke callback and do not process the request.
-      Array<RequestStreamOutput> output{RequestStreamOutput(
-          request->id, std::vector<IntTuple>(request->generation_cfg->n),
-          Optional<Array<Array<String>>>(),
-          std::vector<Optional<String>>(request->generation_cfg->n, String("length")))};
-      request_stream_callback_.value()(std::move(output));
+    if (request->prompt_tokens >= engine_config_->max_single_sequence_length &&
+        request_stream_callback_ != nullptr) {
+      this->StreamBackError(request, "length");
       return;
     }
 
@@ -272,7 +552,7 @@ class EngineImpl : public Engine {
     int n = request->generation_cfg->n;
     int rng_seed = request->generation_cfg->seed;
     auto grammar_state_init_ctx =
-        ResponseFormatToGrammarInitContext(request->generation_cfg->response_format);
+        GetGrammarInitCtxFromResponseFormat(request->generation_cfg->response_format);
 
     std::vector<RequestStateEntry> rsentries;
     // Create the request state entry for the input.
@@ -290,12 +570,13 @@ class EngineImpl : public Engine {
                                /*parent_idx=*/0);
       }
     }
-    RequestState rstate = RequestState(std::move(rsentries), add_time_point);
+    RequestState rstate = RequestState(std::move(rsentries), n, add_time_point);
     for (const RequestStateEntry& rsentry : rstate->entries) {
       // Set the back reference.
       // note, we avoid cyclic reference and use raw ptr.
       rsentry->rstate = rstate.operator->();
     }
+    request->rstate = rstate.operator->();
     estate_->request_states.emplace(request->id, rstate);
   }
 
@@ -340,13 +621,8 @@ class EngineImpl : public Engine {
     }
 
     // Send a callback to notice the abortion.
-    if (request_stream_callback_.defined()) {
-      Array<RequestStreamOutput> output{RequestStreamOutput(
-          request_id, std::vector<IntTuple>(request->generation_cfg->n),
-          Optional<Array<Array<String>>>(),
-          std::vector<Optional<String>>(request->generation_cfg->n, String("abort")))};
-      request_stream_callback_.value()(std::move(output));
-    }
+    this->StreamBackError(request, "abort");
+    estate_->running_rsentries_changed = true;
   }
 
   void AbortAllRequests() final {
@@ -365,14 +641,18 @@ class EngineImpl : public Engine {
   /*********************** Engine Action ***********************/
 
   void Step() final {
-    CHECK(request_stream_callback_.defined())
+    CHECK(request_stream_callback_ != nullptr)
         << "The request stream callback is not set. Engine cannot execute.";
     for (EngineAction action : actions_) {
-      Array<Request> processed_requests = action->Step(estate_);
+      Array<Request> processed_requests;
+      {
+        NVTXScopedRange nvtx_scope("Action step");
+        processed_requests = action->Step(estate_);
+      }
       if (!processed_requests.empty()) {
         ActionStepPostProcess(processed_requests, estate_, models_, tokenizer_,
-                              request_stream_callback_.value(),
-                              engine_config_->max_single_sequence_length, trace_recorder_);
+                              request_stream_callback_, engine_config_->max_single_sequence_length,
+                              trace_recorder_);
         return;
       }
     }
@@ -382,27 +662,56 @@ class EngineImpl : public Engine {
   }
 
   /************** Utility Functions **************/
-  Optional<Session> CreateDiscoSession(const std::vector<picojson::object>& model_configs,
-                                       Device device) {
+  std::tuple<Optional<Session>, int, std::vector<int>> CreateDiscoSession(
+      const std::vector<std::string>& model_libs,
+      const std::vector<picojson::object>& model_configs, Device device) {
     const auto& base_model_config = model_configs[0];
 
-    auto f_get_num_shards = [](const picojson::object& model_config) -> int {
-      constexpr auto kNumShardsKey = "tensor_parallel_shards";
-      if (model_config.count(kNumShardsKey)) {
-        const auto& val = model_config.at(kNumShardsKey);
-        CHECK(val.is<int64_t>());
-        return static_cast<int>(val.get<int64_t>());
+    auto f_get_num_shards_num_stages =
+        [&device](const std::string& model_lib,
+                  const picojson::object& model_config) -> std::pair<int, int> {
+      if (!StartsWith(model_lib, "system://")) {
+        Module executable = tvm::runtime::Module::LoadFromFile(model_lib);
+        PackedFunc fload_exec = executable->GetFunction("vm_load_executable");
+        ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
+        Module local_vm = fload_exec();
+        local_vm->GetFunction("vm_initialization")(
+            static_cast<int>(device.device_type), device.device_id,
+            static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled),
+            static_cast<int>(kDLCPU), 0,
+            static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled));
+        ModelMetadata metadata = ModelMetadata::FromModule(local_vm, std::move(model_config));
+        return {metadata.tensor_parallel_shards, metadata.pipeline_parallel_stages};
       } else {
-        LOG(FATAL) << "Key \"tensor_parallel_shards\" not found.";
+        return {1, 1};
       }
-      throw;
     };
 
-    int num_shards = std::transform_reduce(
-        model_configs.begin(), model_configs.end(), 1, [](int a, int b) { return std::max(a, b); },
-        f_get_num_shards);
+    int num_shards = -1;
+    int max_num_stages = 1;
+    std::vector<int> model_num_pipeline_stages;
+    model_num_pipeline_stages.reserve(model_libs.size());
+    ICHECK_EQ(model_libs.size(), model_configs.size());
+    for (int i = 0; i < static_cast<int>(model_libs.size()); ++i) {
+      auto [model_num_shards, model_num_stages] =
+          f_get_num_shards_num_stages(model_libs[i], model_configs[i]);
+      model_num_pipeline_stages.push_back(model_num_stages);
+      max_num_stages = std::max(max_num_stages, model_num_stages);
+      if (i == 0) {
+        num_shards = model_num_shards;
+      } else {
+        CHECK_EQ(model_num_shards, num_shards)
+            << "Inconsistent tensor_parallel_shards values across models. Some model is compiled "
+               "with tensor_parallel_shards "
+            << num_shards << " and some other model is compiled with tensor_parallel_shards "
+            << model_num_shards;
+      }
+    }
+
     Optional<Session> session = NullOpt;
-    if (num_shards > 1) {
+    int num_workers = num_shards * max_num_stages;
+    if (num_workers > 1) {
+#ifndef MLC_SINGLE_GPU_ONLY
       constexpr const char* f_create_process_pool = "runtime.disco.create_process_pool";
       if (Registry::Get(f_create_process_pool) == nullptr) {
         LOG(FATAL) << "Cannot find process launcher `" << f_create_process_pool << "`. "
@@ -417,14 +726,53 @@ class EngineImpl : public Engine {
         LOG(FATAL) << "ValueError: Multi-GPU on device " << DLDeviceType2Str(device.device_type)
                    << " is not supported. Currently, only NCCL and RCCL are integrated.";
       }
-      std::vector<int64_t> device_ids(num_shards);
-      for (int i = 0; i < num_shards; ++i) {
+      std::vector<int64_t> device_ids(num_workers);
+      for (int i = 0; i < num_workers; ++i) {
         device_ids[i] = i;
       }
-      session = Session::ProcessSession(num_shards, f_create_process_pool, "mlc_llm.cli.worker");
+      const std::string& green_text_begin = "\033[92m";
+      const std::string& yellow_text_begin = "\033[93m";
+      const std::string& colored_text_end = "\033[0m";
+      auto [socket_host, socket_port] = GetEnvSocketHostPort();
+      if (max_num_stages > 1 && socket_host.has_value()) {
+        // Use SocketSession when pipeline parallelism enabled and socket host and port are set.
+        CHECK_GT(socket_port, 0)
+            << "Invalid MLC socket port " << socket_port
+            << ". Please set a valid port value in environment variable \"MLC_SOCKET_PORT\".";
+        LOG(INFO) << "Creating MLC socket session with socket host " << socket_host.value()
+                  << " and port " << socket_port;
+        LOG(INFO) << "Please launch " << green_text_begin << max_num_stages - 1 << colored_text_end
+                  << " remote socket node(s) with the following command to proceed:\n\t"
+                  << green_text_begin << "python -m mlc_llm.cli.disco_remote_socket_session "
+                  << socket_host.value() << " " << socket_port << " " << num_shards
+                  << colored_text_end;
+        const PackedFunc* f_create_socket_sess = Registry::Get("runtime.disco.SocketSession");
+        CHECK(f_create_socket_sess != nullptr)
+            << "SocketSession constructor \"runtime.disco.SocketSession\" not found in TVM "
+               "registry.";
+        Session sess =
+            (*f_create_socket_sess)(max_num_stages, num_shards, /*num_groups=*/max_num_stages,
+                                    socket_host.value(), socket_port);
+        session = std::move(sess);
+      } else {
+        if (max_num_stages > 1) {
+          LOG(INFO)
+              << yellow_text_begin
+              << "Model is enabled with \"pipeline_parallel_stages\" but the socket host/port is "
+                 "not set. If you intend to run the model on multiple nodes, please set "
+                 "environment variable \"MLC_SOCKET_HOST\" and \"MLC_SOCKET_PORT\" and run again."
+              << colored_text_end;
+        }
+        // Use ProcessSession otherwise.
+        session = Session::ProcessSession(num_workers, max_num_stages, f_create_process_pool,
+                                          "mlc_llm.cli.worker");
+      }
       session.value()->InitCCL(ccl, ShapeTuple(device_ids));
+#else
+      LOG(FATAL) << "MLC_SINGLE_GPU_ONLY is specified. Multi-GPU is not enabled.";
+#endif  // MLC_SINGLE_GPU_ONLY
     }
-    return session;
+    return {session, num_shards, model_num_pipeline_stages};
   }
 
   /************** Debug/Profile **************/
@@ -498,7 +846,10 @@ class EngineImpl : public Engine {
     inferrable_cfg = inferrable_cfg_res.Unwrap();
     ICHECK(inferrable_cfg.max_num_sequence.has_value());
     ICHECK(inferrable_cfg.max_total_sequence_length.has_value());
-    ICHECK(inferrable_cfg.max_single_sequence_length.has_value());
+    use_kv_cache = ModelsUseKVCache(model_configs);
+    if (use_kv_cache.Unwrap()) {
+      ICHECK(inferrable_cfg.max_single_sequence_length.has_value());
+    }
     ICHECK(inferrable_cfg.prefill_chunk_size.has_value());
     ICHECK(inferrable_cfg.max_history_size.has_value());
     return TResult::Ok(EngineConfig::FromJSONAndInferredConfig(config, inferrable_cfg));
@@ -510,14 +861,16 @@ class EngineImpl : public Engine {
     for (Model model : models_) {
       host_cpu_usage += model->EstimateHostCPURequirement();
     }
-    int max_concurrency = tvm::runtime::threading::MaxConcurrency();
-    tvm::runtime::threading::SetMaxConcurrency(
-        std::min(std::max(max_concurrency - host_cpu_usage, 1), engine_config_->max_num_sequence));
+    if (host_cpu_usage > 1) {
+      int max_concurrency = tvm::runtime::threading::MaxConcurrency();
+      tvm::runtime::threading::SetMaxConcurrency(std::min(
+          std::max(max_concurrency - host_cpu_usage, 1), engine_config_->max_num_sequence));
+    }
   }
 
   /*! \brief Create a grammar init context according to the response format. If the response format
    * is not JSON, return std::nullopt. */
-  std::optional<std::shared_ptr<GrammarStateInitContext>> ResponseFormatToGrammarInitContext(
+  std::optional<std::shared_ptr<GrammarStateInitContext>> GetGrammarInitCtxFromResponseFormat(
       const ResponseFormat& response_format) {
     if (response_format.type != "json_object") {
       return std::nullopt;
@@ -533,6 +886,7 @@ class EngineImpl : public Engine {
   EngineState estate_;
   // Configurations and singletons
   EngineConfig engine_config_;
+  // internal tokenizer
   Tokenizer tokenizer_;
   std::vector<std::string> token_table_;
   // Helper to get the grammar init context for requests.
@@ -544,7 +898,7 @@ class EngineImpl : public Engine {
   // Workspace of each model.
   std::vector<ModelWorkspace> model_workspaces_;
   // Request stream callback function
-  Optional<PackedFunc> request_stream_callback_;
+  FRequestStreamCallback request_stream_callback_;
   // Engine actions.
   Array<EngineAction> actions_;
   // Event trace recorder.
@@ -553,9 +907,9 @@ class EngineImpl : public Engine {
 
 Result<EngineCreationOutput> Engine::Create(const std::string& engine_config_json_str,
                                             Device device,
-                                            Optional<PackedFunc> request_stream_callback,
+                                            FRequestStreamCallback request_stream_callback,
                                             Optional<EventTraceRecorder> trace_recorder) {
-  return EngineImpl::Create(engine_config_json_str, device, std::move(request_stream_callback),
+  return EngineImpl::Create(engine_config_json_str, device, request_stream_callback,
                             std::move(trace_recorder));
 }
 
@@ -575,19 +929,18 @@ class EngineModule : public ModuleNode {
   TVM_MODULE_VTABLE_ENTRY("create_request", &EngineModule::CreateRequest);
   TVM_MODULE_VTABLE_ENTRY("abort_request", &EngineModule::Abort);
   TVM_MODULE_VTABLE_ENTRY("step", &EngineModule::Step);
-  TVM_MODULE_VTABLE_ENTRY("json_metrics", &EngineModule::JSONMetrics);
   TVM_MODULE_VTABLE_ENTRY("reset", &EngineModule::Reset);
+  TVM_MODULE_VTABLE_ENTRY("json_metrics", &EngineModule::JSONMetrics);
   TVM_MODULE_VTABLE_ENTRY("get_request_stream_callback", &EngineModule::GetRequestStreamCallback);
   TVM_MODULE_VTABLE_ENTRY("set_request_stream_callback", &EngineModule::SetRequestStreamCallback);
   TVM_MODULE_VTABLE_END();
 
   /*! \brief Initialize the engine with config and other fields. */
   void Init(const std::string& engine_config_json_str, Device device,
-            Optional<PackedFunc> request_stream_callback,
+            FRequestStreamCallback request_stream_callback,
             Optional<EventTraceRecorder> trace_recorder) {
-    Result<EngineCreationOutput> output_res =
-        Engine::Create(engine_config_json_str, device, std::move(request_stream_callback),
-                       std::move(trace_recorder));
+    Result<EngineCreationOutput> output_res = Engine::Create(
+        engine_config_json_str, device, request_stream_callback, std::move(trace_recorder));
     CHECK(output_res.IsOk()) << output_res.UnwrapErr();
     EngineCreationOutput output = output_res.Unwrap();
     this->engine_ = std::move(output.reloaded_engine);
@@ -599,25 +952,27 @@ class EngineModule : public ModuleNode {
   void AddRequest(Request request) { return GetEngine()->AddRequest(std::move(request)); }
   /*! \brief Redirection to `Engine::AbortRequest`. */
   void Abort(const String& request_id) { return GetEngine()->AbortRequest(request_id); }
-
+  /*! \brief Create request with given arguments and the engine default generation config. */
   Request CreateRequest(String id, Array<Data> inputs, String generation_cfg_json_str) {
-    return Request(
-        std::move(id), std::move(inputs),
-        GenerationConfig(std::move(generation_cfg_json_str), default_generation_config_));
+    auto config = json::ParseToJSONObject(generation_cfg_json_str);
+    auto gen_config = GenerationConfig::FromJSON(config, default_generation_config_);
+    CHECK(gen_config.IsOk()) << gen_config.UnwrapErr();
+    return Request(std::move(id), std::move(inputs), gen_config.Unwrap());
   }
   /*! \brief Redirection to `Engine::Step`. */
   void Step() { return GetEngine()->Step(); }
   /*! \brief Redirection to `Engine::GetRequestStreamCallback`. */
-  Optional<PackedFunc> GetRequestStreamCallback() {
+  FRequestStreamCallback GetRequestStreamCallback() {
     return GetEngine()->GetRequestStreamCallback();
   }
   /*! \brief Redirection to `Engine::SetRequestStreamCallback` */
-  void SetRequestStreamCallback(Optional<PackedFunc> request_stream_callback) {
-    GetEngine()->SetRequestStreamCallback(std::move(request_stream_callback));
+  void SetRequestStreamCallback(FRequestStreamCallback request_stream_callback) {
+    GetEngine()->SetRequestStreamCallback(request_stream_callback);
   }
   /*! \brief Redirection to `Engine::Reset`. */
   void Reset() { return GetEngine()->Reset(); }
-  /*! \brief Redirection to `Engine::Metrics` */
+
+  /*! \brief Redirection to `Engine::JSONMetrics`. */
   String JSONMetrics() { return GetEngine()->JSONMetrics(); }
 
  private:

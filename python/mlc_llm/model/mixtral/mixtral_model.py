@@ -10,7 +10,7 @@ from mlc_llm import op as op_ext
 from mlc_llm.model.llama.llama_model import (
     LlamaAttention,
     LlamaConfig,
-    LlamaForCasualLM,
+    LlamaForCausalLM,
     LlamaModel,
 )
 from mlc_llm.nn import PagedKVCache
@@ -39,6 +39,11 @@ class MixtralMoE(nn.Module):
         super().__init__()
         self.num_experts_per_tok = config.num_experts_per_tok
         self.num_local_experts = config.num_local_experts
+        if config.intermediate_size % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split MoE intermediate size {config.intermediate_size} "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
         self.gate = nn.Linear(
             in_features=config.hidden_size,
@@ -171,7 +176,7 @@ class MixtralModel(LlamaModel):
         )
 
 
-class MixtralForCasualLM(LlamaForCasualLM):
+class MixtralForCasualLM(LlamaForCausalLM):
     """Same as LlamaForCausalLM."""
 
     def __init__(self, config: MixtralConfig):

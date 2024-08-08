@@ -59,7 +59,7 @@ class Phi1Config(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     break
             else:
                 raise ValueError(
-                    "Unable to determine the maxmimum sequence length, because none of "
+                    "Unable to determine the maximum sequence length, because none of "
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
@@ -176,6 +176,11 @@ class PhiConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
 class PhiMLP(nn.Module):
     def __init__(self, config: PhiConfig):
         super().__init__()
+        if config.n_inner % config.tensor_parallel_shards != 0:
+            raise ValueError(
+                f"Cannot split MLP intermediate size {config.n_inner} "
+                f"evenly to {config.tensor_parallel_shards} GPUs."
+            )
         self.intermediate_size = config.n_inner // config.tensor_parallel_shards
         self.fc1 = nn.Linear(config.n_embd, self.intermediate_size)
         self.fc2 = nn.Linear(self.intermediate_size, config.n_embd)

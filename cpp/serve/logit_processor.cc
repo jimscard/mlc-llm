@@ -49,16 +49,21 @@ class LogitProcessorImpl : public LogitProcessorObj {
         apply_penalty_func_(ft->apply_penalty_func_),
         apply_bitmask_func_(ft->apply_bitmask_func_),
         trace_recorder_(std::move(trace_recorder)) {
-    DLDevice device_cpu{DLDeviceType::kDLCPU, /*device_id=*/0};
+    Device preferred_host_device = GetPreferredHostDevice(device);
     // Initialize auxiliary arrays on CPU.
-    seq_ids_host_ = NDArray::Empty({max_num_token}, dtype_i32_, device_cpu);
-    pos2seq_id_host_ = NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, device_cpu);
-    token_ids_host_ = NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, device_cpu);
-    token_cnt_host_ = NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, device_cpu);
-    token_logit_bias_host_ = NDArray::Empty({max_num_token * vocab_size}, dtype_f32_, device_cpu);
-    penalties_host_ = NDArray::Empty({max_num_token, 3}, dtype_f32_, device_cpu);
-    bitmask_host_ = NDArray::Empty({max_num_token, bitmask_size_}, dtype_u32_, device_cpu);
-    temperature_host_ = NDArray::Empty({max_num_token}, dtype_f32_, device_cpu);
+    seq_ids_host_ = NDArray::Empty({max_num_token}, dtype_i32_, preferred_host_device);
+    pos2seq_id_host_ =
+        NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, preferred_host_device);
+    token_ids_host_ =
+        NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, preferred_host_device);
+    token_cnt_host_ =
+        NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, preferred_host_device);
+    token_logit_bias_host_ =
+        NDArray::Empty({max_num_token * vocab_size}, dtype_f32_, preferred_host_device);
+    penalties_host_ = NDArray::Empty({max_num_token, 3}, dtype_f32_, preferred_host_device);
+    bitmask_host_ =
+        NDArray::Empty({max_num_token, bitmask_size_}, dtype_u32_, preferred_host_device);
+    temperature_host_ = NDArray::Empty({max_num_token}, dtype_f32_, preferred_host_device);
     // Initialize auxiliary arrays on GPU.
     seq_ids_device_ = NDArray::Empty({max_num_token}, dtype_i32_, device);
     pos2seq_id_device_ = NDArray::Empty({max_num_token * vocab_size}, dtype_i32_, device);
@@ -128,6 +133,9 @@ class LogitProcessorImpl : public LogitProcessorObj {
     RECORD_EVENT(trace_recorder_, request_ids, "finish apply penalty");
 
     // Update 3. Vocabulary mask.
+    // Note: The mask application must be placed as the last step in logit processor.
+    // This is because the masked logits are set to the minimal value.
+    // Further logit subtraction may cause issue such as underflow.
     RECORD_EVENT(trace_recorder_, request_ids, "start apply logit mask");
     UpdateWithMask(logits, mstates, cum_num_token, draft_tokens);
     RECORD_EVENT(trace_recorder_, request_ids, "finish apply logit mask");
@@ -291,7 +299,9 @@ class LogitProcessorImpl : public LogitProcessorObj {
           p_penalties[num_token_for_penalty * 3 + 2] = generation_cfg[i]->repetition_penalty;
           ++num_token_for_penalty;
           if (j > 0) {
-            mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1);
+            // Assume chain-style token tree.
+            mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1,
+                                      j - 1 - 1);
           }
         }
         if (num_token_to_process != 1) {
@@ -371,7 +381,8 @@ class LogitProcessorImpl : public LogitProcessorObj {
           p_seq_ids[token_start_offset + j] = 1;
         }
         if (j > 0) {
-          mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1);
+          // Assume chain-style token tree.
+          mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1, j - 1 - 1);
         }
       }
       if (token_number != 1) {
