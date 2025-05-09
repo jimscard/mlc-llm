@@ -1,6 +1,6 @@
 """OpenAI API-compatible server entrypoints in MLC LLM"""
 
-# pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
+# pylint: disable=too-many-locals,too-many-return-statements,too-many-statements,fixme
 from http import HTTPStatus
 from typing import AsyncGenerator, List, Optional
 
@@ -9,6 +9,7 @@ import fastapi
 from mlc_llm.protocol import error_protocol
 from mlc_llm.protocol.openai_api_protocol import (
     ChatCompletionRequest,
+    CompletionLogProbs,
     CompletionRequest,
     ListResponse,
     LogProbsContent,
@@ -51,7 +52,9 @@ async def request_completion(request: CompletionRequest, raw_request: fastapi.Re
         return error_protocol.create_error_response(
             HTTPStatus.BAD_REQUEST, message=f'The requested model "{request.model}" is not served.'
         )
-    request_id = f"cmpl-{engine_utils.random_uuid()}"
+    # FIXME: This is a temporary solution to make sure
+    # prep_recv, remote_send and start_generation process the same request
+    request_id = request.user if request.user is not None else f"cmpl-{engine_utils.random_uuid()}"
 
     # Streaming response.
     if request.stream:
@@ -80,11 +83,9 @@ async def request_completion(request: CompletionRequest, raw_request: fastapi.Re
 
     # Normal response.
     request_final_usage = None
-    output_texts = ["" for _ in range(request.n)]
-    finish_reasons: List[Optional[str]] = [None for _ in range(request.n)]
-    logprob_results: Optional[List[List[LogProbsContent]]] = (
-        [[] for _ in range(request.n)] if request.logprobs else None
-    )
+    output_texts = [""] * request.n
+    finish_reasons: List[Optional[str]] = [None] * request.n
+    logprob_results: List[Optional[CompletionLogProbs]] = [None] * request.n
 
     async for response in async_engine._handle_completion(  # pylint: disable=protected-access
         request, request_id, request_final_usage_include_extra=request_final_usage_include_extra
@@ -110,10 +111,15 @@ async def request_completion(request: CompletionRequest, raw_request: fastapi.Re
             if choice.finish_reason is not None and finish_reasons[choice.index] is None:
                 finish_reasons[choice.index] = choice.finish_reason
             if choice.logprobs is not None:
-                assert logprob_results is not None
-                logprob_results[choice.index] += choice.logprobs.content
+                if logprob_results[choice.index] is None:
+                    logprob_results[choice.index] = choice.logprobs
+                else:
+                    logprob_results[choice.index].token_logprobs.extend(
+                        choice.logprobs.token_logprobs
+                    )
+                    logprob_results[choice.index].tokens.extend(choice.logprobs.tokens)
+                    logprob_results[choice.index].top_logprobs.extend(choice.logprobs.top_logprobs)
 
-    assert all(finish_reason is not None for finish_reason in finish_reasons)
     return engine_base.wrap_completion_response(
         request_id=request_id,
         model=request.model,
@@ -147,7 +153,11 @@ async def request_chat_completion(
         return error_protocol.create_error_response(
             HTTPStatus.BAD_REQUEST, message=f'The requested model "{request.model}" is not served.'
         )
-    request_id = f"chatcmpl-{engine_utils.random_uuid()}"
+    # FIXME: This is a temporary solution to make sure
+    # prep_recv, remote_send and start_generation process the same request
+    request_id = (
+        request.user if request.user is not None else f"chatcmpl-{engine_utils.random_uuid()}"
+    )
 
     # Streaming response.
     if request.stream:

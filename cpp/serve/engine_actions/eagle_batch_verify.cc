@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/eagle_batch_verify.cc
  */
 
@@ -62,17 +62,21 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     std::vector<int64_t> request_internal_ids;
     std::vector<int32_t> all_tokens_to_verify;
     Array<RequestModelState> verify_request_mstates;
+    Array<RequestModelState> draft_request_mstates;
     Array<GenerationConfig> generation_cfg;
     std::vector<RandomGenerator*> rngs;
     std::vector<std::vector<SampleResult>> draft_output_tokens;
+    std::vector<std::vector<int>> draft_token_indices;
     std::vector<int64_t> token_tree_parent_ptr;
     request_internal_ids.reserve(num_rsentries);
     all_tokens_to_verify.reserve(total_draft_length);
     token_tree_parent_ptr.reserve(total_draft_length);
     verify_request_mstates.reserve(num_rsentries);
+    draft_request_mstates.reserve(num_rsentries);
     rngs.reserve(num_rsentries);
     generation_cfg.reserve(num_rsentries);
     draft_output_tokens.reserve(num_rsentries);
+    draft_token_indices.reserve(num_rsentries);
     draft_token_slots_.clear();
 
     for (int i = 0; i < num_rsentries; ++i) {
@@ -92,7 +96,11 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
         draft_token_slots_.push_back(draft_mstate->draft_token_slots[j]);
         token_tree_parent_ptr.push_back(draft_mstate->draft_token_parent_idx[j] + 1);
       }
+      std::vector<int> cur_draft_token_indices(draft_mstate->draft_output_tokens.size() + 1);
+      std::iota(cur_draft_token_indices.begin(), cur_draft_token_indices.end(), -1);
+      draft_token_indices.emplace_back(std::move(cur_draft_token_indices));
       verify_request_mstates.push_back(verify_mstate);
+      draft_request_mstates.push_back(draft_mstate);
       generation_cfg.push_back(rsentries[i]->request->generation_cfg);
       rngs.push_back(&rsentries[i]->rng);
       draft_output_tokens.push_back(draft_mstate->draft_output_tokens);
@@ -126,7 +134,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
 
     // - Update logits.
     logit_processor_->InplaceUpdateLogits(logits, generation_cfg, verify_request_mstates,
-                                          request_ids, &cum_verify_lengths, &draft_output_tokens);
+                                          request_ids, &cum_verify_lengths, &draft_request_mstates,
+                                          &draft_token_indices);
 
     // - Compute probability distributions.
     NDArray probs_on_device = logit_processor_->ComputeProbsFromLogits(
@@ -140,10 +149,9 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     NDArray renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
         probs_on_device, sample_indices, request_ids, generation_cfg);
-    std::vector<std::vector<SampleResult>> sample_results_arr =
-        sampler_->BatchVerifyDraftTokensWithProbAfterTopP(
-            renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
-            draft_output_tokens, token_tree_parent_ptr, draft_probs_on_device);
+    auto [sample_results_arr, _] = sampler_->BatchVerifyDraftTokensWithProbAfterTopP(
+        renormalized_probs, request_ids, cum_verify_lengths, generation_cfg, rngs,
+        draft_output_tokens, token_tree_parent_ptr, draft_probs_on_device);
     ICHECK_EQ(sample_results_arr.size(), num_rsentries);
 
     // We collect the requests whose drafts are fully accepted.
@@ -170,6 +178,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
       // Metrics update
       // live update the output metrics
       rsentries[i]->rstate->metrics.completion_tokens += accept_length;
+      rsentries[i]->rstate->metrics.decode_tokens += accept_length;
       estate->metrics.spec_decode.Update(cum_verify_lengths[i + 1] - cum_verify_lengths[i],
                                          accept_length);
       // - Minus one because the last draft token has no kv cache entry
@@ -311,7 +320,8 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
         UpdateRequestStatesWithDraftProposals(mstates, sample_results, draft_model_id_,
                                               renormalized_probs, hidden_states, estate);
       } else if (engine_config_->speculative_mode == SpeculativeMode::kMedusa) {
-        for (int draft_id = 0; draft_id < engine_config_->spec_draft_length; draft_id++) {
+        ICHECK_NE(estate->spec_draft_length, 0);
+        for (int draft_id = 0; draft_id < estate->spec_draft_length; draft_id++) {
           const auto& [renormalized_probs, sample_results] = ApplyLogitProcessorAndSample(
               logit_processor_, sampler_, multi_step_logits[draft_id], generation_cfg, request_ids,
               mstates, rngs, sample_indices, generation_cfg, request_ids, sample_indices);
@@ -398,7 +408,7 @@ class EagleBatchVerifyActionObj : public EngineActionObj {
     models_[0]->ScatterDraftProbs(renormalized_probs, draft_token_slots_,
                                   &model_workspaces_[0].draft_probs_storage);
     if (engine_config_->speculative_mode == SpeculativeMode::kEagle &&
-        engine_config_->spec_draft_length > 1) {
+        estate->spec_draft_length > 1) {
       models_[0]->ScatterHiddenStates(hidden_states_for_sample, draft_token_slots_,
                                       &model_workspaces_[0].draft_hidden_states_storage);
     }

@@ -52,7 +52,7 @@ Once you have launched the Server, you can use the API in your own program to se
    choices = r.json()["choices"]
    for choice in choices:
       print(f"{choice['message']['content']}\n")
-      
+
 Run CLI with Multi-GPU
 ----------------------
 
@@ -129,9 +129,10 @@ MODEL                  The model folder after compiling with MLC-LLM build proce
                        than the main model).
 
                        When engine is enabled with speculative decoding, additional models are needed.
-                       The way of specifying additional models is:
-                       ``--additional-models model_path_1 model_path_2 ...`` or
-                       ``--additional-models model_path_1,model_lib_1 model_path_2 ...``.
+                       **We only support one additional model for speculative decoding now.**
+                       The way of specifying the additional model is:
+                       ``--additional-models model_path_1`` or
+                       ``--additional-models model_path_1,model_lib_1``.
 
                        When the model lib of a model is not given, JIT model compilation will be activated
                        to compile the model automatically.
@@ -218,7 +219,7 @@ The REST API provides the following endpoints:
 
 - **logprobs** (*bool*, optional, default=False): Indicates whether to include log probabilities for each token in the response.
 
-- **top_logprobs** (*int*, optional, default=0): An integer ranging from 0 to 5. It determines the number of tokens, most likely to appear at each position, to be returned. Each token is accompanied by a log probability. If this parameter is used, 'logprobs' must be set to true.
+- **top_logprobs** (*int*, optional, default=0): An integer ranging from 0 to 20. It determines the number of tokens, most likely to appear at each position, to be returned. Each token is accompanied by a log probability. If this parameter is used, 'logprobs' must be set to true.
 
 - **logit_bias** (*Optional[Dict[int, float]]*): Allows specifying biases for or against specific tokens during generation.
 
@@ -432,6 +433,3 @@ Function Calling with streaming is also supported. Below is an example on how to
 
 .. note::
    The API is a uniform interface that supports multiple languages. You can also utilize these functionalities in languages other than Python.
-
-
-

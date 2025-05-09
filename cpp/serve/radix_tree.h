@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/radix_tree.h
  */
 #ifndef MLC_LLM_SERVE_RADIX_TREE_H_
@@ -106,7 +106,6 @@ class PagedRadixTreeObj : public Object {
    */
   virtual void Reset() = 0;
 
-  static constexpr const uint32_t _type_index = TypeIndex::kDynamic;
   static constexpr const char* _type_key = "mlc.serve.PagedRadixTree";
   TVM_DECLARE_BASE_OBJECT_INFO(PagedRadixTreeObj, Object)
 };

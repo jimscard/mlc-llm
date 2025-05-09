@@ -51,6 +51,13 @@ def detect_target_and_host(target_hint: str, host_hint: str = "auto") -> Tuple[T
         )
         target = Target(target_dict)
         _register_cuda_hook(target)
+    elif target.kind.name == "rocm":
+        target_dict = dict(target.export())
+        extra_libs = ["thrust", "rocblas", "miopen", "hipblas"]
+        target_dict["libs"] = (
+            (target_dict["libs"] + extra_libs) if "libs" in target_dict else extra_libs
+        )
+        target = Target(target_dict)
     return target, build_func
 
 
@@ -140,7 +147,7 @@ def _build_metal_x86_64():
         relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
         ).export_library(
             str(output),
             fcompile=xcode.create_dylib,
@@ -165,7 +172,7 @@ def _build_iphone():
         relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=True,
         ).export_library(
             str(output),
@@ -180,15 +187,20 @@ def _build_android():
         output = args.output
         mod = _add_system_lib_prefix(mod, args.system_lib_prefix, is_system_lib=True)
         assert output.suffix == ".tar"
-        relax.build(
+        ex = relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=True,
-        ).export_library(
+        )
+        ex.export_library(
             str(output),
             fcompile=tar.tar,
         )
+        if args.debug_dump is not None:
+            source = ex.mod.imported_modules[0].imported_modules[0].get_source()
+            with open(args.debug_dump / "kernel.cl", "w", encoding="utf-8") as f:
+                f.write(source)
 
     return build
 
@@ -198,15 +210,20 @@ def _build_android_so():
         output = args.output
         mod = _add_system_lib_prefix(mod, args.system_lib_prefix, is_system_lib=False)
         assert output.suffix == ".so"
-        relax.build(
+        ex = relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=False,
-        ).export_library(
+        )
+        ex.export_library(
             str(output),
             fcompile=ndk.create_shared,
         )
+        if args.debug_dump is not None:
+            source = ex.mod.imported_modules[0].imported_modules[0].get_source()
+            with open(args.debug_dump / "kernel.cl", "w", encoding="utf-8") as f:
+                f.write(source)
 
     return build
 
@@ -241,7 +258,7 @@ def _build_webgpu():
         relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=True,
         ).export_library(
             str(output),
@@ -259,7 +276,7 @@ def _build_mali():
         mod = relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=True,
         )
         if "TVM_NDK_CC" in os.environ:
@@ -284,7 +301,7 @@ def _build_default():
         relax.build(
             mod,
             target=args.target,
-            pipeline=pipeline,
+            relax_pipeline=pipeline,
             system_lib=system_lib,
         ).export_library(
             str(output),
@@ -419,6 +436,17 @@ PRESET = {
             },
         },
         "build": _build_android_so,
+    },
+    "windows:adreno_x86": {
+        "target": {
+            "kind": "opencl",
+            "device": "adreno",
+            "max_threads_per_block": 512,
+            "host": {
+                "kind": "llvm",
+                "mtriple": "x86_64-pc-windows-msvc",
+            },
+        },
     },
     "metal:x86-64": {
         "target": {

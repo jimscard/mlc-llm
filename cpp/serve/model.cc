@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/model.cc
  * \brief The implementation of runtime module of LLM functions (prefill/decode/etc.)
  */
@@ -13,6 +13,7 @@
 #include <fstream>
 
 #include "../support/json_parser.h"
+#include "../support/vlm_utils.h"
 #include "config.h"
 #include "logit_processor.h"
 
@@ -59,7 +60,7 @@ class ModelImpl : public ModelObj {
   explicit ModelImpl(String reload_lib_path, String model_path, picojson::object model_config,
                      DLDevice device, const Optional<Session>& session, int num_shards,
                      int num_stages, bool trace_enabled)
-      : model_(model_path), device_(device) {
+      : model_(model_path), device_(device), trace_enabled_(trace_enabled) {
     // Step 1. Process model config json string.
     LoadModelConfigJSON(model_config);
     // Step 2. Initialize vm, we use the packed function mechanism
@@ -113,8 +114,19 @@ class ModelImpl : public ModelObj {
   ObjectRef ImageEmbed(const NDArray& image, ObjectRef* dst, int offset) final {
     NVTXScopedRange nvtx_scope("ImageEmbed");
     CHECK(ft_.image_embed_func_.defined()) << "`image_embed` function is not found in the model. ";
+
+    int tmp_h = 0, tmp_w = 0;
+    CalculateResizeShape(image, this->model_type_, &tmp_h, &tmp_w);
+    ShapeTuple resize_h = {tmp_h};
+    ShapeTuple resize_w = {tmp_w};
+
+    CalculateCropShape(image, this->model_type_, &tmp_h, &tmp_w);
+    ShapeTuple crop_h = {tmp_h};
+    ShapeTuple crop_w = {tmp_w};
+
     auto image_dref_or_nd = ft_.CopyToWorker0(image, "image", image.Shape());
-    ObjectRef embeddings = ft_.image_embed_func_(image_dref_or_nd, params_);
+    ObjectRef embeddings =
+        ft_.image_embed_func_(image_dref_or_nd, resize_h, resize_w, crop_h, crop_w, params_);
     if (dst != nullptr) {
       CHECK(dst->defined());
       ft_.nd_copy_embedding_to_offset_func_(embeddings, *dst, offset);
@@ -257,12 +269,34 @@ class ModelImpl : public ModelObj {
     ICHECK_NE(max_num_sequence_, -1);
     ObjectRef logit_pos_dref_or_nd =
         ft_.CopyToWorker0(logit_pos_nd, "logit_pos", {max_num_sequence_});
+
+    PackedFunc single_batch_prefill_func = ft_.single_batch_prefill_func_;
+    PackedFunc prefill_func = ft_.prefill_func_;
+    if (ft_.single_batch_extend_func_.defined()) {
+      CHECK(ft_.extend_func_.defined()) << "`batch_extend` function is not found in the model.";
+      bool has_existing_sequence = false;
+      for (int64_t seq_id : seq_ids) {
+        if (prefilled_seq_ids_.count(seq_id)) {
+          has_existing_sequence = true;
+          break;
+        }
+      }
+      if (has_existing_sequence) {
+        single_batch_prefill_func = ft_.single_batch_extend_func_;
+        prefill_func = ft_.extend_func_;
+      }
+
+      for (int64_t seq_id : seq_ids) {
+        prefilled_seq_ids_.insert(seq_id);
+      }
+    }
+
     // args: embeddings, logit_pos, kv_cache, params
     ObjectRef ret;
     if (seq_ids.size() == 1) {
-      ret = ft_.single_batch_prefill_func_(embeddings_dref_or_nd, kv_cache_, params_);
+      ret = single_batch_prefill_func(embeddings_dref_or_nd, kv_cache_, params_);
     } else {
-      ret = ft_.prefill_func_(embeddings_dref_or_nd, logit_pos_dref_or_nd, kv_cache_, params_);
+      ret = prefill_func(embeddings_dref_or_nd, logit_pos_dref_or_nd, kv_cache_, params_);
     }
     NDArray logits;
     if (ft_.use_disco) {
@@ -417,6 +451,78 @@ class ModelImpl : public ModelObj {
     // logits: (b, 1, v)
     ICHECK_EQ(logits->ndim, 3);
     ICHECK_EQ(logits->shape[0], num_sequence);
+    ICHECK_EQ(logits->shape[1], 1);
+    return logits;
+  }
+
+  NDArray BatchTreeDecode(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
+                          const std::vector<int>& lengths,
+                          const std::vector<int64_t>& token_tree_parent_ptr) {
+    // This is similar to BatchDecode, except that it takes 'length', so that each sequence can have
+    // multiple leaf nodes for decoding.
+    NVTXScopedRange nvtx_scope("BatchTreeDecode num_seqs=" + std::to_string(seq_ids.size()));
+    int num_sequence = seq_ids.size();
+    int total_length = 0;
+    for (int i = 0; i < num_sequence; ++i) {
+      total_length += lengths[i];
+    }
+    CHECK_EQ(total_length, token_tree_parent_ptr.size());
+
+    CHECK(ft_.decode_func_.defined())
+        << "`tree_decode_with_embed` function is not found in the model. Please make sure the "
+           "model "
+           "is compiled with flag `--sep-embed` and `--enable-batching`";
+    ICHECK(ft_.kv_cache_begin_forward_func_.defined());
+    ICHECK(ft_.kv_cache_end_forward_func_.defined());
+    ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    // Reserve in KV cache for the lengths of the input.
+    // Begin forward with the sequence ids and new lengths.
+    IntTuple seq_ids_tuple(seq_ids);
+    IntTuple lengths_tuple(lengths.begin(), lengths.end());
+    IntTuple token_tree_parent_ptr_tuple(token_tree_parent_ptr);
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, lengths_tuple,
+                                     token_tree_parent_ptr_tuple);
+
+    ObjectRef embeddings_dref_or_nd;
+    if (!embeddings->IsInstance<DRefObj>()) {
+      // embeddings: (1, n, h)
+      NDArray embeddings_nd = Downcast<NDArray>(embeddings);
+      ICHECK_NE(hidden_size_, -1);
+      ICHECK_EQ(embeddings_nd->ndim, 2);
+      ICHECK_GE(embeddings_nd->shape[0], total_length);
+      ICHECK_EQ(embeddings_nd->shape[1], hidden_size_);
+      ICHECK_EQ(embeddings_nd->device.device_type, device_.device_type);
+      ICHECK_EQ(embeddings_nd->device.device_id, device_.device_id);
+      embeddings_dref_or_nd =
+          embeddings_nd.CreateView({total_length, 1, hidden_size_}, embeddings_nd->dtype);
+    } else {
+      ShapeTuple embedding_shape{total_length, 1, hidden_size_};
+      embeddings_dref_or_nd = ft_.nd_view_func_(embeddings, embedding_shape);
+    }
+
+    // same as BatchDecode
+    ObjectRef ret;
+    if (0 && seq_ids.size() == 1) {
+      ret = ft_.single_batch_decode_func_(embeddings_dref_or_nd, kv_cache_, params_);
+    } else {
+      ret = ft_.decode_func_(embeddings_dref_or_nd, kv_cache_, params_);
+    }
+    NDArray logits;
+    if (ft_.use_disco) {
+      Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0);
+      logits = Downcast<NDArray>(result[0]);
+    } else {
+      logits = Downcast<Array<NDArray>>(ret)[0];
+    }
+    if (trace_enabled_) {
+      TVMSynchronize(device_.device_type, device_.device_id, nullptr);
+    }
+    ft_.kv_cache_end_forward_func_(kv_cache_);
+
+    // logits: (b, 1, v)
+    ICHECK_EQ(logits->ndim, 3);
+    ICHECK_EQ(logits->shape[0], total_length);
     ICHECK_EQ(logits->shape[1], 1);
     return logits;
   }
@@ -647,12 +753,14 @@ class ModelImpl : public ModelObj {
       return;
     }
     ft_.kv_cache_fork_sequence_func_(kv_cache_, parent_seq_id, child_seq_id, fork_pos);
+    prefilled_seq_ids_.insert(child_seq_id);
   }
 
   void RemoveSequence(int64_t seq_id) final {
     if (this->kind == KVStateKind::kNone) {
       return;
     }
+    prefilled_seq_ids_.erase(seq_id);
     ft_.kv_cache_remove_sequence_func_(kv_cache_, seq_id);
   }
 
@@ -680,6 +788,38 @@ class ModelImpl : public ModelObj {
       ft_.kv_cache_enable_sliding_window_for_seq_(kv_cache_, seq_id, sliding_window_size_,
                                                   attention_sink_size_);
     }
+  }
+
+  IntTuple DisaggPrepareKVRecv(int64_t seq_id, int length) final {
+    NVTXScopedRange nvtx_scope("DisaggPrepareKVRecv length=" + std::to_string(length));
+
+    ICHECK(ft_.kv_cache_disagg_prepare_recv_func_.defined());
+    ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    // Run KV receive preparation.
+    ObjectRef ret;
+    ret = ft_.kv_cache_disagg_prepare_recv_func_(kv_cache_, seq_id, length);
+    IntTuple compressed_kv_append_metadata;
+    if (ft_.use_disco) {
+      compressed_kv_append_metadata = Downcast<DRef>(ret)->DebugGetFromRemote(0);
+    } else {
+      compressed_kv_append_metadata = Downcast<IntTuple>(ret);
+    }
+
+    return compressed_kv_append_metadata;
+  }
+
+  void DisaggMarkKVSend(int64_t seq_id, int begin_pos, IntTuple compressed_kv_append_metadata,
+                        int dst_group_offset) final {
+    NVTXScopedRange nvtx_scope("DisaggMarkKVSend seq_id=" + std::to_string(seq_id) +
+                               " begin_pos=" + std::to_string(begin_pos));
+
+    ICHECK(ft_.kv_cache_disagg_mark_send_func_.defined());
+    ICHECK(kv_cache_.defined()) << "KV cache has not been initialized.";
+
+    // Run KV send preparation.
+    ft_.kv_cache_disagg_mark_send_func_(kv_cache_, seq_id, begin_pos, compressed_kv_append_metadata,
+                                        dst_group_offset);
   }
 
   /************** Raw Info Query **************/
@@ -884,8 +1024,8 @@ class ModelImpl : public ModelObj {
 
   /************** Debug/Profile **************/
 
-  void DebugCallFuncOnAllAllWorker(const String& func_name) final {
-    ft_.DebugCallFuncOnAllAllWorker(func_name);
+  void DebugCallFuncOnAllAllWorker(const String& func_name, Optional<String> func_args) final {
+    ft_.DebugCallFuncOnAllAllWorker(func_name, func_args);
   }
 
  private:
@@ -899,6 +1039,7 @@ class ModelImpl : public ModelObj {
         json::LookupOrDefault<int64_t>(config, "attention_sink_size", this->attention_sink_size_);
     this->attention_sink_size_ = std::max(this->attention_sink_size_, 0);
     this->vocab_size_ = json::Lookup<int64_t>(config, "vocab_size");
+    this->model_type_ = json::Lookup<std::string>(config, "model_type");
   }
 
   //----------------------------
@@ -915,6 +1056,7 @@ class ModelImpl : public ModelObj {
   DLDataType hidden_states_dtype_;
   int vocab_size_ = -1;
   int image_embed_size_ = -1;
+  std::string model_type_;
   //----------------------------
   // TVM related states
   //----------------------------
@@ -940,6 +1082,8 @@ class ModelImpl : public ModelObj {
   bool trace_enabled_;
   // An enum indicating whether it's RNN-based.
   KVStateKind kind;
+  // A set of sequence IDs that have been prefilled.
+  std::unordered_set<int64_t> prefilled_seq_ids_;
 };
 
 TVM_REGISTER_GLOBAL("mlc.copy_embedding_to_offset")

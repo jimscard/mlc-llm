@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/function_table.cc
  * \brief The implementation of function table in serving for distributed inference.
  */
@@ -123,6 +123,14 @@ void FunctionTable::Init(String reload_lib_path, Device device, picojson::object
     } else {
       executable = tvm::runtime::Module::LoadFromFile(reload_lib_path);
       fload_exec = executable->GetFunction("vm_load_executable");
+      /* precompile opencl kernel programs */
+      if (device.device_type == kDLOpenCL) {
+        auto f_get = executable->GetFunction("opencl.GetPreCompiledPrograms", true);
+        std::string ss = f_get();
+        auto bytes = tvm::String(ss);
+        auto f_set = executable->GetFunction("opencl.SetPreCompiledPrograms", true);
+        f_set(tvm::String(bytes));
+      }
       ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
     }
     this->use_disco = false;
@@ -144,6 +152,10 @@ void FunctionTable::Init(String reload_lib_path, Device device, picojson::object
   }
   ICHECK_EQ(this->model_metadata_.tensor_parallel_shards, num_shards);
   ICHECK_EQ(this->model_metadata_.pipeline_parallel_stages, num_stages);
+  // Invoke the CUDA graph allocation init function if it is defined.
+  if (cuda_graph_alloc_init_func_.defined()) {
+    this->cuda_graph_alloc_init_func_();
+  }
 }
 
 ObjectRef FunctionTable::LoadParams(const std::string& model_path, Device device) {
@@ -166,7 +178,6 @@ ObjectRef FunctionTable::LoadParams(const std::string& model_path, Device device
                                 ? "mlc.multi_gpu.LoadMultiGPU"
                                 : "mlc.multi_gpu.LoadMultiGPUPresharded";
       PackedFunc loader = this->get_global_func(load_func_name);
-      // Todo: check if the logic makes sense
       params = loader(model_path, this->disco_mod, picojson::value(this->model_config).serialize());
     }
     return params;
@@ -206,8 +217,10 @@ void FunctionTable::_InitFunctions() {
   this->image_embed_func_ = mod_get_func("image_embed");
   this->single_batch_prefill_func_ = mod_get_func("prefill");
   this->single_batch_decode_func_ = mod_get_func("decode");
+  this->single_batch_extend_func_ = mod_get_func("extend");
   this->prefill_func_ = mod_get_func("batch_prefill");
   this->decode_func_ = mod_get_func("batch_decode");
+  this->extend_func_ = mod_get_func("batch_extend");
   this->verify_func_ = mod_get_func("batch_verify");
   this->single_batch_prefill_to_last_hidden_func_ = mod_get_func("prefill_to_last_hidden_states");
   this->single_batch_decode_to_last_hidden_func_ = mod_get_func("decode_to_last_hidden_states");
@@ -224,8 +237,9 @@ void FunctionTable::_InitFunctions() {
   this->apply_penalty_func_ = mod->GetFunction("apply_penalty_inplace", true);
   this->apply_bitmask_func_ = mod->GetFunction("apply_bitmask_inplace", true);
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
+  this->cuda_graph_alloc_init_func_ = mod_get_func("cuda_graph_alloc_init");
   this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
-  if (!this->create_kv_cache_func_.defined()) {
+  if (this->model_metadata_.sliding_window_size != -1 || !this->create_kv_cache_func_.defined()) {
     PackedFunc f_create_rnn_state = mod_get_func("create_rnn_state");
     if (f_create_rnn_state.defined()) {
       this->create_kv_cache_func_ = f_create_rnn_state;
@@ -241,6 +255,9 @@ void FunctionTable::_InitFunctions() {
   this->kv_cache_remove_sequence_func_ = get_global_func("vm.builtin.kv_state_remove_sequence");
   this->kv_cache_begin_forward_func_ = get_global_func("vm.builtin.kv_state_begin_forward");
   this->kv_cache_end_forward_func_ = get_global_func("vm.builtin.kv_state_end_forward");
+  this->kv_cache_disagg_prepare_recv_func_ =
+      get_global_func("vm.builtin.kv_cache_disagg_prepare_recv");
+  this->kv_cache_disagg_mark_send_func_ = get_global_func("vm.builtin.kv_cache_disagg_mark_send");
   this->kv_cache_popn_func_ = get_global_func("vm.builtin.kv_state_popn");
   this->kv_cache_commit_accepted_token_tree_nodes_func_ =
       get_global_func("vm.builtin.attention_kv_cache_commit_accepted_token_tree_nodes");
@@ -261,7 +278,10 @@ void FunctionTable::_InitFunctions() {
   this->nd_copy_embedding_to_offset_func_ = get_global_func("mlc.copy_embedding_to_offset");
   support_backtracking_kv_ = true;
   this->tuple_getitem_func_ = get_global_func("vm.builtin.tuple_getitem");
-  this->last_group_send_to_worker_0_ = get_global_func("mlc.multi_gpu.SendFromLastGroupToWorker0");
+  if (use_disco) {
+    this->last_group_send_to_worker_0_ =
+        get_global_func("mlc.multi_gpu.SendFromLastGroupToWorker0");
+  }
 
   this->gather_probs_func_ = mod->GetFunction("gather_probs", true);
   this->scatter_probs_func_ = mod->GetFunction("scatter_probs", true);
@@ -303,6 +323,13 @@ ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String buffer_
     NDArray buffer{nullptr};
     if (it != this->cached_buffers.end()) {
       buffer = Downcast<NDArray>((*it).second);
+      if (buffer_cache_key == "image") {
+        if (runtime::GetDataSize(*buffer.operator->()) <
+            runtime::GetDataSize(*host_array.operator->())) {
+          buffer = NDArray::Empty(max_reserved_shape, host_array->dtype, local_gpu_device);
+          this->cached_buffers.Set(buffer_cache_key, buffer);
+        }
+      }
     } else {
       buffer = NDArray::Empty(max_reserved_shape, host_array->dtype, local_gpu_device);
       this->cached_buffers.Set(buffer_cache_key, buffer);
@@ -314,13 +341,25 @@ ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String buffer_
   }
 }
 
-void FunctionTable::DebugCallFuncOnAllAllWorker(const String& func_name) const {
-  if (this->use_disco) {
-    sess->CallPacked(sess->GetGlobalFunc(func_name));
+void FunctionTable::DebugCallFuncOnAllAllWorker(const String& func_name,
+                                                Optional<String> func_args) const {
+  if (func_args) {
+    std::string args = func_args.value();
+    if (this->use_disco) {
+      sess->CallPacked(sess->GetGlobalFunc(func_name), args);
+    } else {
+      const PackedFunc* func = Registry::Get(func_name);
+      CHECK(func != nullptr) << "Global function name \"" << func_name << "\" is not found";
+      (*func)(args);
+    }
   } else {
-    const PackedFunc* func = Registry::Get(func_name);
-    CHECK(func != nullptr) << "Global function name \"" << func_name << "\" is not found";
-    (*func)();
+    if (this->use_disco) {
+      sess->CallPacked(sess->GetGlobalFunc(func_name));
+    } else {
+      const PackedFunc* func = Registry::Get(func_name);
+      CHECK(func != nullptr) << "Global function name \"" << func_name << "\" is not found";
+      (*func)();
+    }
   }
 }
 

@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/prefix_cache.cc
  */
 #include "prefix_cache.h"
@@ -96,7 +96,7 @@ class PrefixCacheImpl : public PrefixCacheObj {
           }
         }
       }
-      if (shortest_recycling_seq_id != -1) {
+      if (shortest_recycling_seq_id != -1 && matched_offset > shortest_recycling_seq_length * 0.9) {
         ReuseRecyclingSequence(shortest_recycling_seq_id);
         if (shortest_recycling_seq_length > matched_offset) {
           // Recycling sequence is longer than new sequence, rolling back the redundant trailing

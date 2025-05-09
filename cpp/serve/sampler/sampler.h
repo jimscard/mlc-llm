@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/sampler/sampler.h
  * \brief The header for runtime module of sampler functions.
  */
@@ -110,9 +110,11 @@ class SamplerObj : public Object {
    * \param draft_probs_on_device The probability distribution computed from the
    * small model for each sequence. Concatenated tensor of shape (total_verify_length, vocab_size).
    * It includes the slot for the last committed token that has undefined probablity value.
-   * \return The list of accepted tokens for each request.
+   * \return The list of accepted tokens for each request and the index of the last accepted tree
+   * node for each request.
    */
-  virtual std::vector<std::vector<SampleResult>> BatchVerifyDraftTokensWithProbAfterTopP(
+  virtual std::pair<std::vector<std::vector<SampleResult>>, std::vector<int>>
+  BatchVerifyDraftTokensWithProbAfterTopP(
       NDArray probs, const Array<String>& request_ids, const std::vector<int>& cum_verify_lengths,
       const Array<GenerationConfig>& generation_cfg, const std::vector<RandomGenerator*>& rngs,
       const std::vector<std::vector<SampleResult>>& draft_output_tokens,

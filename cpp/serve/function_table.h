@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/function_table.h
  * \brief The header for function table in serving for distributed inference.
  */
@@ -63,7 +63,7 @@ struct FunctionTable {
   ObjectRef CopyToWorker0(const NDArray& host_array, String buffer_cache_key,
                           ShapeTuple max_reserved_shape, bool local_only = false);
 
-  void DebugCallFuncOnAllAllWorker(const String& func_name) const;
+  void DebugCallFuncOnAllAllWorker(const String& func_name, Optional<String> func_args) const;
 
   bool use_disco = false;
   Device local_gpu_device;
@@ -82,8 +82,10 @@ struct FunctionTable {
   PackedFunc image_embed_func_;
   PackedFunc single_batch_prefill_func_;
   PackedFunc single_batch_decode_func_;
+  PackedFunc single_batch_extend_func_;
   PackedFunc prefill_func_;
   PackedFunc decode_func_;
+  PackedFunc extend_func_;
   PackedFunc verify_func_;
   PackedFunc single_batch_prefill_to_last_hidden_func_;
   PackedFunc single_batch_decode_to_last_hidden_func_;
@@ -99,6 +101,7 @@ struct FunctionTable {
   PackedFunc apply_penalty_func_;
   PackedFunc apply_bitmask_func_;
   PackedFunc alloc_embedding_tensor_func_;
+  PackedFunc cuda_graph_alloc_init_func_;
   PackedFunc create_kv_cache_func_;
   PackedFunc reset_kv_cache_func_;
   bool support_backtracking_kv_;
@@ -108,6 +111,8 @@ struct FunctionTable {
   PackedFunc kv_cache_remove_sequence_func_;
   PackedFunc kv_cache_begin_forward_func_;
   PackedFunc kv_cache_end_forward_func_;
+  PackedFunc kv_cache_disagg_prepare_recv_func_;
+  PackedFunc kv_cache_disagg_mark_send_func_;
   PackedFunc kv_cache_popn_func_;
   PackedFunc kv_cache_commit_accepted_token_tree_nodes_func_;
   PackedFunc kv_cache_get_num_available_pages_func_;

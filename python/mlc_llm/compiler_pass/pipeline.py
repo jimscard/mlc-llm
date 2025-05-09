@@ -12,6 +12,7 @@ from tvm.relax.frontend import nn
 from mlc_llm.interface.compiler_flags import IPCAllReduceStrategyType
 from mlc_llm.support import logging
 
+from .attach_cuda_graph_alloc_init_func import AttachCUDAGraphAllocInitFunc
 from .attach_embedding_allocator import AttachAllocEmbeddingTensorFunc
 from .attach_logit_processor import AttachLogitProcessFunc
 from .attach_sampler import AttachGPUSamplingFunc
@@ -24,9 +25,10 @@ from .attach_support_info import (
     AttachPipelineParallelStages,
     AttachVariableBounds,
 )
+from .blas_dispatch import BLASDispatch
 from .clean_up_tir_attrs import CleanUpTIRAttrs
-from .cublas_dispatch import CublasDispatch
 from .dispatch_kv_cache_creation import DispatchKVCacheCreation
+from .dispatch_triton_kernel import DispatchTritonKernel
 from .estimate_memory_usage import AttachMetadataWithMemoryUsage
 from .fuse_add_norm import FuseAddRMSNorm
 from .fuse_dequantize_matmul_ewise import FuseDequantizeMatmulEwise
@@ -116,10 +118,15 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 _DebugDump("debug-phase0.py", debug_dump, show_meta=False),
                 # Phase 1. Passes on high-level operator graph
                 _LogProgress("Running TVM Relax graph-level optimizations"),
+                DispatchTritonKernel(target),
                 FuseFTDequantizeEpilogue(),
                 FuseDequantizeTranspose(),
-                CublasDispatch() if cublas_gemm else tvm.transform.Sequential([]),
-                FuseAddRMSNorm(target=target),
+                BLASDispatch(target) if cublas_gemm else tvm.transform.Sequential([]),
+                (
+                    FuseAddRMSNorm(target=target)
+                    if target.kind.name != "llvm"
+                    else tvm.transform.Sequential([])
+                ),
                 FuseTransposeMatmul(),
                 _DebugDump("debug-phase1.py", debug_dump, show_meta=False),
                 # Phase 2. Lowering to TIR, inherited TVM Relax's official "zero" pipeline
@@ -142,16 +149,26 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 # Phase 4. Low-level Optimizations
                 _LogProgress("Running TVM Dlight low-level optimizations"),
                 LowBatchGemvSpecialize(),
-                dl.ApplyDefaultSchedule(
-                    dl.gpu.Matmul(),
-                    dl.gpu.GEMV(),
-                    dl.gpu.Reduction(),
-                    dl.gpu.GeneralReduction(),
-                    dl.gpu.Fallback(),
+                (
+                    dl.ApplyDefaultSchedule(
+                        dl.gpu.Matmul(),
+                        dl.gpu.GEMV(),
+                        dl.gpu.Reduction(),
+                        dl.gpu.GeneralReduction(),
+                        dl.gpu.Fallback(),
+                    )
+                    if target.kind.name != "llvm"
+                    else dl.ApplyDefaultSchedule(
+                        dl.cpu.GEMV(),
+                    )
                 ),
                 _DebugDump("debug-phase4.py", debug_dump, show_meta=False),
                 _LogProgress("Lowering to VM bytecode"),
-                LiftTIRGlobalBufferAlloc(),
+                (
+                    LiftTIRGlobalBufferAlloc()
+                    if target.kind.name != "llvm"
+                    else tvm.transform.Sequential([])
+                ),
                 (
                     tvm.tir.transform.ForceNarrowIndexToInt32()
                     if target.kind.name != "cuda"
@@ -159,7 +176,6 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 ),
                 ScatterTupleGetItem(),
                 PipelineParallelRewrite(),
-                _DebugDump("after-pipeline-rewrite.py", debug_dump, show_meta=False),
                 tvm.relax.transform.RewriteDataflowReshape(),
                 tvm.relax.transform.ToNonDataflow(),
                 tvm.relax.transform.RemovePurityChecking(),
@@ -171,14 +187,15 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 ),
                 tvm.relax.transform.StaticPlanBlockMemory(),
                 AttachMetadataWithMemoryUsage(metadata),
+                _DebugDump("debug-phase5.py", debug_dump, show_meta=False),
                 tvm.relax.transform.RewriteCUDAGraph(),
+                AttachCUDAGraphAllocInitFunc(),
                 tvm.relax.transform.LowerGPUIPCAllocStorage(),
                 tvm.relax.transform.LowerAllocTensor(),
                 tvm.relax.transform.KillAfterLastUse(),
-                tvm.relax.transform.VMBuiltinLower(),
+                tvm.relax.transform.LowerRuntimeBuiltin(),
                 tvm.relax.transform.VMShapeLower(),
                 tvm.relax.transform.AttachGlobalSymbol(),
-                _DebugDump("debug-final.py", debug_dump, show_meta=False),
                 _LogProgress("Compiling external modules"),
                 tvm.relax.transform.AttachExternModules(ext_mods),
                 _LogProgress("Compilation complete! Exporting to disk"),

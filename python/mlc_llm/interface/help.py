@@ -122,6 +122,9 @@ Number of shards to split the model into in tensor parallelism multi-gpu inferen
     """pipeline_parallel_stages""": """
 Number of pipeline stages to split the model layers for pipeline parallelism.
 """.strip(),
+    """disaggregation""": """
+Whether enable disaggregation when compiling the model.
+""".strip(),
     "overrides": """
 Model configuration override. Configurations to override `mlc-chat-config.json`. Supports
 `context_window_size`, `prefill_chunk_size`, `sliding_window_size`, `attention_sink_size`,
@@ -210,7 +213,9 @@ The speculative decoding mode. Right now four options are supported:
 The default mode is "disable".
 """.strip(),
     "spec_draft_length_serve": """
-The number of draft tokens to generate in speculative proposal. The default values is 4.
+The number of draft tokens to generate in speculative proposal.
+Being 0 means to enable adaptive speculative mode, where the draft length will be
+automatically adjusted based on engine state. The default values is 0.
 """.strip(),
     "prefix_cache_mode_serve": """
 The prefix cache mode. Right now two options are supported:
@@ -257,4 +262,8 @@ The output directory to save the calibration params.
     """.strip(),
     "seed_calibrate": """
 The seed to sample the calibration dataset.""",
+    "pd_balance_factor": """
+How much prefill to move to decode engine. For example,
+0.1 means the last 10 percent tokens are prefilled by decode engine.
+    """.strip(),
 }

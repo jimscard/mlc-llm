@@ -8,6 +8,7 @@
 # model preset templates
 from . import (
     cohere,
+    deepseek,
     dolly,
     gemma,
     glm,
@@ -17,9 +18,12 @@ from . import (
     llama,
     llava,
     mistral,
+    nemotron,
     oasst,
+    olmo,
     orion,
     phi,
+    qwen2,
     redpajama,
     rwkv,
     stablelm,

@@ -11,6 +11,7 @@ from mlc_llm.serve import engine
 from mlc_llm.serve.entrypoints import (
     debug_entrypoints,
     metrics_entrypoints,
+    microserving_entrypoints,
     openai_entrypoints,
 )
 from mlc_llm.serve.server import ServerContext
@@ -28,6 +29,7 @@ def serve(
     additional_models: List[Union[str, Tuple[str, str]]],
     tensor_parallel_shards: Optional[int],
     pipeline_parallel_stages: Optional[int],
+    opt: Optional[str],
     max_num_sequence: Optional[int],
     max_total_sequence_length: Optional[int],
     max_single_sequence_length: Optional[int],
@@ -38,6 +40,7 @@ def serve(
     gpu_memory_utilization: Optional[float],
     speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"],
     spec_draft_length: Optional[int],
+    spec_tree_width: Optional[int],
     prefix_cache_mode: Literal["disable", "radix"],
     prefix_cache_max_num_recycling_seqs: Optional[int],
     prefill_mode: Literal["hybrid", "chunked"],
@@ -60,6 +63,7 @@ def serve(
             additional_models=additional_models,
             tensor_parallel_shards=tensor_parallel_shards,
             pipeline_parallel_stages=pipeline_parallel_stages,
+            opt=opt,
             max_num_sequence=max_num_sequence,
             max_total_sequence_length=max_total_sequence_length,
             max_single_sequence_length=max_single_sequence_length,
@@ -70,6 +74,7 @@ def serve(
             gpu_memory_utilization=gpu_memory_utilization,
             speculative_mode=speculative_mode,
             spec_draft_length=spec_draft_length,
+            spec_tree_width=spec_tree_width,
             prefix_cache_mode=prefix_cache_mode,
             prefix_cache_max_num_recycling_seqs=prefix_cache_max_num_recycling_seqs,
             prefill_mode=prefill_mode,
@@ -91,6 +96,7 @@ def serve(
 
         app.include_router(openai_entrypoints.app)
         app.include_router(metrics_entrypoints.app)
+        app.include_router(microserving_entrypoints.app)
 
         server_context.enable_debug = enable_debug
 

@@ -1,10 +1,12 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/action_commons.h
  * \brief Common functions that may be used in multiple EngineActions.
  */
 #ifndef MLC_LLM_SERVE_ENGINE_ACTIONS_ACTION_COMMONS_H_
 #define MLC_LLM_SERVE_ENGINE_ACTIONS_ACTION_COMMONS_H_
+
+#include <tvm/runtime/container/array.h>
 
 #include "../../tokenizers/tokenizers.h"
 #include "../draft_token_workspace_manager.h"
@@ -12,12 +14,21 @@
 #include "../engine_state.h"
 #include "../event_trace_recorder.h"
 #include "../model.h"
+#include "action.h"
 
 namespace mlc {
 namespace llm {
 namespace serve {
 
 using namespace tvm::runtime;
+
+/*! \brief Create the engine actions based on engine config. */
+Array<EngineAction> CreateEngineActions(
+    Array<Model> models, EngineConfig engine_config, std::vector<picojson::object> model_configs,
+    std::vector<ModelWorkspace> model_workspaces, LogitProcessor logit_processor, Sampler sampler,
+    DraftTokenWorkspaceManager draft_token_workspace_manager, Tokenizer tokenizer,
+    Optional<EventTraceRecorder> trace_recorder, FRequestStreamCallback request_stream_callback,
+    Device device);
 
 /*!
  * \brief Remove the given request from models.
@@ -40,6 +51,7 @@ void RemoveRequestFromModel(EngineState estate, int64_t req_internal_id,
  * \param tokenizer The tokenizer for logprob process.
  * \param request_stream_callback The request stream callback function.
  * \param max_single_sequence_length The max single sequence length to help decide
+ * \param draft_token_workspace_manager The draft token workspace manager.
  * \param trace_recorder The event trace recorder for requests.
  * if a request is finished.
  */
@@ -47,6 +59,7 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
                            const Tokenizer& tokenizer,
                            FRequestStreamCallback request_stream_callback,
                            int64_t max_single_sequence_length,
+                           Optional<DraftTokenWorkspaceManager> draft_token_workspace_manager,
                            Optional<EventTraceRecorder> trace_recorder);
 
 /*!

@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_state.h
  */
 #ifndef MLC_LLM_SERVE_ENGINE_STATE_H_
@@ -19,6 +19,8 @@ namespace llm {
 namespace serve {
 
 using namespace tvm::runtime;
+
+typedef TypedPackedFunc<void(Array<RequestStreamOutput>)> FRequestStreamCallback;
 
 /*! \brief The manager of internal id for requests in engine. */
 struct EngineInternalIDManager {
@@ -72,6 +74,17 @@ class EngineStateObj : public Object {
   PrefixCache prefix_cache{nullptr};
   /*! \brief A boolean flag denoting whether the running request state entry list has changed. */
   bool running_rsentries_changed = true;
+  /*!
+   * \brief The current engine speculative decoding draft length.
+   * The length may change across time under the auto speculative decoding mode.
+   * Value 0 means undefined. It must have a positive value for speculative decoding to
+   * properly work.
+   */
+  int spec_draft_length = 0;
+  /*! \brief A boolean flag denoting whether the engine is in disaggregation mode. */
+  bool disaggregation = false;
+  // Request stream callback function
+  FRequestStreamCallback request_stream_callback_;
   /*!
    * \brief The post-process data structures.
    * We make it a workspace to avoid repetitive memory allocation/free in the action post process.

@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/model.h
  * \brief The header for runtime module of LLM functions (prefill/decode/etc.)
  */
@@ -175,6 +175,10 @@ class ModelObj : public Object {
    */
   virtual NDArray BatchDecode(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids) = 0;
 
+  virtual NDArray BatchTreeDecode(const ObjectRef& embeddings, const std::vector<int64_t>& seq_ids,
+                                  const std::vector<int>& lengths,
+                                  const std::vector<int64_t>& token_tree_parent_ptr) = 0;
+
   /*!
    * \brief Batch decode function. Input hidden_states are computed from
    * input embeddings and previous hidden_states, output last hidden_states.
@@ -267,6 +271,13 @@ class ModelObj : public Object {
    */
   virtual void EnableSlidingWindowForSeq(int64_t seq_id) = 0;
 
+  /*! \brief Prepare for the disaggregation KV data receive for the specified sequence and length.*/
+  virtual IntTuple DisaggPrepareKVRecv(int64_t seq_id, int length) = 0;
+
+  /*! \brief Prepare for the disaggregation KV data send for the specified sequence and length.*/
+  virtual void DisaggMarkKVSend(int64_t seq_id, int begin_pos,
+                                IntTuple compressed_kv_append_metadata, int dst_group_offset) = 0;
+
   /************** Raw Info Query **************/
 
   /*! \brief Return the metadata JSON object of the model. */
@@ -351,7 +362,7 @@ class ModelObj : public Object {
   /************** Debug/Profile **************/
 
   /*! \brief Call the given global function on all workers. Only for debug purpose. */
-  virtual void DebugCallFuncOnAllAllWorker(const String& func_name) = 0;
+  virtual void DebugCallFuncOnAllAllWorker(const String& func_name, Optional<String> func_args) = 0;
 
   static constexpr const char* _type_key = "mlc.serve.Model";
   static constexpr const bool _type_has_method_sequal_reduce = false;

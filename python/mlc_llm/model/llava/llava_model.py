@@ -10,12 +10,12 @@ from typing import Any, Dict, Optional
 from tvm import tir
 from tvm.relax.frontend import nn
 from tvm.relax.frontend.nn import Module, Tensor
-from tvm.relax.frontend.nn.op import reshape, wrap_nested
+from tvm.relax.frontend.nn.op import permute_dims, reshape, wrap_nested
 from tvm.relax.op import strided_slice
 
 from mlc_llm import op as op_ext
 from mlc_llm.model.model_preset import MODEL_PRESETS
-from mlc_llm.model.vision import CLIPVisionConfig, CLIPVisionModel
+from mlc_llm.model.vision import CLIPVisionConfig, CLIPVisionModel, ImageProcessor
 from mlc_llm.nn import PagedKVCache, RopeMode
 
 from ...support.config import ConfigBase
@@ -139,6 +139,7 @@ class LlavaForCasualLM(Module):
         super().__init__()
         self.config = config
         self.vision_tower = CLIPVisionModel(config.vision_config)
+        self.image_processor = ImageProcessor()
         self.multi_modal_projector = LlavaMultiModalProjector(config)
         self.language_model = ARCHITECTURE_MAP[config.text_architecture](config.text_config)
         self.vocab_size = config.vocab_size
@@ -153,7 +154,27 @@ class LlavaForCasualLM(Module):
     def embed(self, input_ids: Tensor) -> Tensor:
         return self.language_model.embed(input_ids)
 
+    def image_preprocess(self, pixel_values: Tensor) -> Tensor:
+        pixel_values = permute_dims(pixel_values, axes=(0, 3, 1, 2))  # NHWC -> NCHW
+        pixel_values = self.image_processor.resize(
+            pixel_values,
+            {
+                "shortest_edge": self.config.vision_config.image_size,
+            },
+        )
+        pixel_values = self.image_processor.crop(
+            pixel_values,
+            {
+                "height": self.config.vision_config.image_size,
+                "width": self.config.vision_config.image_size,
+            },
+        )
+        pixel_values = self.image_processor.rescale(pixel_values)
+        pixel_values = self.image_processor.normalize(pixel_values)
+        return pixel_values
+
     def image_embed(self, pixel_values: Tensor) -> Tensor:
+        pixel_values = self.image_preprocess(pixel_values)
         pixel_values = pixel_values.astype(self.dtype)
         image_features_all = self.vision_tower.forward(pixel_values)
         image_features = wrap_nested(
@@ -209,6 +230,7 @@ class LlavaForCasualLM(Module):
         support_sliding_window: tir.Var,
     ) -> PagedKVCache:
         return PagedKVCache.create_generic(
+            attn_kind="mha",
             max_batch_size=max_batch_size,
             max_total_seq_len=max_total_seq_len,
             prefill_chunk_size=prefill_chunk_size,
@@ -219,7 +241,8 @@ class LlavaForCasualLM(Module):
             // self.config.tensor_parallel_shards,
             num_key_value_heads=self.config.text_config.num_key_value_heads
             // self.config.tensor_parallel_shards,
-            head_dim=self.config.text_config.head_dim,
+            qk_head_dim=self.config.text_config.head_dim,
+            v_head_dim=self.config.text_config.head_dim,
             rope_mode=RopeMode.NORMAL,
             rope_scale=1,
             rope_theta=self.language_model.rope_theta,
@@ -237,13 +260,8 @@ class LlavaForCasualLM(Module):
             },
             "image_embed": {
                 "pixel_values": nn.spec.Tensor(
-                    [
-                        1,
-                        3,
-                        self.config.vision_config.image_size,
-                        self.config.vision_config.image_size,
-                    ],
-                    "float32",
+                    [1, "image_height", "image_width", 3],
+                    "uint8",
                 ),
                 "$": {
                     "param_mode": "packed",

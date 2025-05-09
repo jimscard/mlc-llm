@@ -137,7 +137,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
             cutlass=args.opt.cutlass,
         )
         # Step 1. Create the quantized model
-        logger.info("Creating model from: %s", args.config)
+        logger.info("Creating model from: %s", model_config)
         if (
             args.quantization.kind == "ft-quant"
             and hasattr(model_config, "tensor_parallel_shards")
@@ -179,6 +179,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
             "prefill_chunk_size": model_config.prefill_chunk_size,  # type: ignore
             "tensor_parallel_shards": model_config.tensor_parallel_shards,  # type: ignore
             "pipeline_parallel_stages": getattr(model_config, "pipeline_parallel_stages", 1),
+            "disaggregation": getattr(model_config, "disaggregation", False),
             "kv_state_kind": _infer_kv_state_kind(args.model.name),
             "max_batch_size": getattr(model_config, "max_batch_size", 1),
         }

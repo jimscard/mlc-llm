@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/batch_decode.cc
  */
 
@@ -40,8 +40,8 @@ class BatchDecodeActionObj : public EngineActionObj {
         trace_recorder_(std::move(trace_recorder)) {}
 
   Array<Request> Step(EngineState estate) final {
-    // - Do not run decode when there are multiple models or no running requests.
-    if (models_.size() > 1 || estate->running_queue.empty()) {
+    // - Do not run decode when there is no running request.
+    if (estate->running_queue.empty()) {
       return {};
     }
 
@@ -57,6 +57,11 @@ class BatchDecodeActionObj : public EngineActionObj {
         if (preempted.same_as(running_rsentries.back())) {
           running_rsentries.pop_back();
         }
+      }
+      while (running_rsentries.size() >
+             std::min(static_cast<int64_t>(engine_config_->max_num_sequence),
+                      engine_config_->prefill_chunk_size)) {
+        running_rsentries.pop_back();
       }
     }
 

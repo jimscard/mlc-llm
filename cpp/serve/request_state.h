@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/request_state.h
  * \brief The data structure maintaining the generation states of user requests.
  */
@@ -9,10 +9,10 @@
 #include <tvm/runtime/container/array.h>
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/object.h>
+#include <xgrammar/xgrammar.h>
 
 #include <optional>
 
-#include "../grammar/grammar_state_matcher.h"
 #include "../support/random.h"
 #include "../tokenizers/streamer.h"
 #include "config.h"
@@ -78,14 +78,17 @@ class RequestModelStateNode : public Object {
   std::vector<int> draft_token_slots;
   /*! \brief The parent indices of the draft tokens. */
   std::vector<int64_t> draft_token_parent_idx;
+  /*! \brief The first child indices of the draft tokens. */
+  std::vector<int64_t> draft_token_first_child_idx;
+
   /*! \brief The appeared committed and draft tokens and their occurrence times. */
   std::unordered_map<int32_t, int32_t> appeared_token_ids;
 
   /*!
    * \brief The current state of the generated token matching the grammar. Used in grammar-guided
-   * generation, otherwise it's NullOpt.
+   * generation, otherwise it's std::nullopt.
    */
-  Optional<GrammarStateMatcher> grammar_state_matcher;
+  std::optional<xgrammar::GrammarMatcher> grammar_matcher;
 
   /*! \brief Return the total length of the input data. */
   int GetInputLength() const;
@@ -99,7 +102,7 @@ class RequestModelStateNode : public Object {
    * \param bitmask The DLTensor to store the next token bitmask. The bitmask should be a tensor
    * with dtype uint32_t and shape (ceildiv(vocab_size, 32),).
    */
-  void FindNextTokenBitmask(DLTensor* bitmask);
+  void GetNextTokenBitmask(DLTensor* bitmask);
   /*! \brief Commit a new token into committed_tokens. Does not effect the kv cache. Update
    * appeared_token_ids and the grammar state. */
   void CommitToken(SampleResult sampled_token);
@@ -116,17 +119,12 @@ class RequestModelStateNode : public Object {
   static constexpr const bool _type_has_method_sequal_reduce = false;
   static constexpr const bool _type_has_method_shash_reduce = false;
   TVM_DECLARE_BASE_OBJECT_INFO(RequestModelStateNode, Object);
-
- private:
-  /*! \brief Remove the last token from draft_output_tokens. Update appeared_token_ids. */
-  void RemoveLastDraftToken();
 };
 
 class RequestModelState : public ObjectRef {
  public:
-  explicit RequestModelState(
-      Request request, int model_id, int64_t internal_id, Array<Data> inputs,
-      const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx);
+  explicit RequestModelState(Request request, int model_id, int64_t internal_id, Array<Data> inputs,
+                             const std::optional<xgrammar::CompiledGrammar>& compiled_grammar);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestModelState, ObjectRef, RequestModelStateNode);
 };
@@ -256,11 +254,10 @@ class RequestStateEntryNode : public Object {
 
 class RequestStateEntry : public ObjectRef {
  public:
-  explicit RequestStateEntry(
-      Request request, int num_models, int64_t internal_id, int rng_seed,
-      const std::vector<std::string>& token_table,
-      const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx,
-      int parent_idx = -1);
+  explicit RequestStateEntry(Request request, int num_models, int64_t internal_id, int rng_seed,
+                             const std::vector<std::string>& token_table,
+                             const std::optional<xgrammar::CompiledGrammar>& compiled_grammar,
+                             int parent_idx = -1);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestStateEntry, ObjectRef, RequestStateEntryNode);
 };

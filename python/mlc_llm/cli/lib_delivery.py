@@ -16,7 +16,6 @@ from mlc_llm.support.argparse import ArgumentParser
 from mlc_llm.support.constants import MLC_TEMP_DIR
 from mlc_llm.support.style import bold, green, red
 
-logging.enable_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -126,7 +125,7 @@ def _main(  # pylint: disable=too-many-locals
     """Compile the model libs in the spec and save them to the binary_libs_dir."""
     failed_cases: List[Any] = []
     for task_index, task in enumerate(spec["tasks"], 1):
-        logger.info(
+        logger.info(  # pylint: disable=logging-not-lazy
             bold("[{task_index}/{total_tasks}] Processing model: ").format(
                 task_index=task_index,
                 total_tasks=len(spec["tasks"]),

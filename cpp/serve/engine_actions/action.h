@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/action.h
  * \brief The abstraction of actions (e.g., prefill/decode) that an
  * Engine can take at each time step.
@@ -9,6 +9,7 @@
 
 #include "../config.h"
 #include "../draft_token_workspace_manager.h"
+#include "../engine.h"
 #include "../engine_state.h"
 #include "../event_trace_recorder.h"
 #include "../model.h"
@@ -117,14 +118,13 @@ class EngineAction : public ObjectRef {
    * \param draft_token_workspace_manager The draft token workspace manager.
    * \param engine_config The engine config.
    * \param trace_recorder The event trace recorder for requests.
-   * \param draft_length The number of draft proposal rounds.
    * \return The created action object.
    */
   static EngineAction BatchDraft(Array<Model> models, LogitProcessor logit_processor,
                                  Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                  DraftTokenWorkspaceManager draft_token_workspace_manager,
                                  EngineConfig engine_config,
-                                 Optional<EventTraceRecorder> trace_recorder, int draft_length);
+                                 Optional<EventTraceRecorder> trace_recorder);
 
   /*!
    * \brief Create the action that runs one-step speculative draft proposal for
@@ -137,15 +137,13 @@ class EngineAction : public ObjectRef {
    * \param draft_token_workspace_manager The draft token workspace manager.
    * \param engine_config The engine config.
    * \param trace_recorder The event trace recorder for requests.
-   * \param draft_length The number of draft proposal rounds.
    * \return The created action object.
    */
   static EngineAction EagleBatchDraft(Array<Model> models, LogitProcessor logit_processor,
                                       Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                       DraftTokenWorkspaceManager draft_token_workspace_manager,
                                       EngineConfig engine_config,
-                                      Optional<EventTraceRecorder> trace_recorder,
-                                      int draft_length = 4);
+                                      Optional<EventTraceRecorder> trace_recorder);
 
   /*!
    * \brief Create the action that runs one-step speculative verification for requests in the
@@ -198,6 +196,52 @@ class EngineAction : public ObjectRef {
    */
   static EngineAction BatchJumpForward(Array<Model> models, Tokenizer tokenizer,
                                        Optional<EventTraceRecorder> trace_recorder);
+
+  /*!
+   * \brief Create the action that first makes a decision on whether to run speculative
+   * decoding or normal mode batch decode, and then runs the selected actions.
+   * \param spec_decode_actions The actions for speculative decoding.
+   * \param batch_decode_actions The actions for normal mode batch decoding.
+   * \param engine_config The engine config.
+   * \return The created action object
+   */
+  static EngineAction AutoSpecDecode(std::vector<EngineAction> spec_decode_actions,
+                                     std::vector<EngineAction> batch_decode_actions,
+                                     EngineConfig engine_config);
+
+  /*!
+   * \brief Create the action that runs the disaggregation preparation for prefill.
+   * \param models The underlying models whose KV cache are to be updated.
+   * \param engine_config The engine config.
+   * \param model_configs The config of each model.
+   * \param trace_recorder The event trace recorder for requests.
+   * \param request_stream_callback The stream callback function to pass the prefill
+   * preparation result back, including the KV cache append metadata and the prefix
+   * matched length in the prefix cache.
+   * \return The created action object.
+   */
+  static EngineAction DisaggPrepareReceive(Array<Model> models, EngineConfig engine_config,
+                                           std::vector<picojson::object> model_configs,
+                                           Optional<EventTraceRecorder> trace_recorder,
+                                           FRequestStreamCallback request_stream_callback);
+
+  /*!
+   * \brief Create the action that runs the prefill and sends KV data to remote instance.
+   * \param models The underlying models whose KV cache are to be updated.
+   * \param model_workspaces The workspace of each model.
+   * \param engine_config The engine config.
+   * \param model_configs The config of each model.
+   * \param trace_recorder The event trace recorder for requests.
+   * \param request_stream_callback The stream callback function to pass the prefill
+   * preparation result back, including the KV cache append metadata and the prefix
+   * matched length in the prefix cache.
+   * \param device The device of the model for synchronization.
+   * \return The created action object.
+   */
+  static EngineAction DisaggRemoteSend(
+      Array<Model> models, std::vector<ModelWorkspace> model_workspaces, EngineConfig engine_config,
+      std::vector<picojson::object> model_configs, Optional<EventTraceRecorder> trace_recorder,
+      FRequestStreamCallback request_stream_callback, Device device);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(EngineAction, ObjectRef, EngineActionObj);
 };

@@ -3,7 +3,7 @@
 import dataclasses
 import json
 from io import StringIO
-from typing import Optional
+from typing import Literal, Optional
 
 from mlc_llm.interface.help import HELP
 from mlc_llm.interface.serve import serve
@@ -22,12 +22,16 @@ class EngineConfigOverride:  # pylint: disable=too-many-instance-attributes
     max_history_size: Optional[int] = None
     gpu_memory_utilization: Optional[float] = None
     spec_draft_length: Optional[int] = None
+    spec_tree_width: Optional[int] = None
+    prefix_cache_mode: Optional[Literal["disable", "radix"]] = None
     prefix_cache_max_num_recycling_seqs: Optional[int] = None
+    prefill_mode: Optional[Literal["chunked", "hybrid"]] = None
     context_window_size: Optional[int] = None
     sliding_window_size: Optional[int] = None
     attention_sink_size: Optional[int] = None
     tensor_parallel_shards: Optional[int] = None
     pipeline_parallel_stages: Optional[int] = None
+    opt: Optional[str] = None
 
     def __repr__(self) -> str:
         out = StringIO()
@@ -37,16 +41,20 @@ class EngineConfigOverride:  # pylint: disable=too-many-instance-attributes
         print(f";max_history_size={self.max_history_size}", file=out, end="")
         print(f";gpu_memory_utilization={self.gpu_memory_utilization}", file=out, end="")
         print(f";spec_draft_length={self.spec_draft_length}", file=out, end="")
+        print(f";spec_tree_width={self.spec_tree_width}", file=out, end="")
+        print(f";prefix_cache_mode={self.prefix_cache_mode}", file=out, end="")
         print(
             f";prefix_cache_max_num_recycling_seqs={self.prefix_cache_max_num_recycling_seqs}",
             file=out,
             end="",
         )
+        print(f";prefill_mode={self.prefill_mode}", file=out, end="")
         print(f";context_window_size={self.context_window_size}", file=out, end="")
         print(f";sliding_window_size={self.sliding_window_size}", file=out, end="")
         print(f";attention_sink_size={self.attention_sink_size}", file=out, end="")
         print(f";tensor_parallel_shards={self.tensor_parallel_shards}", file=out, end="")
         print(f";pipeline_parallel_stages={self.pipeline_parallel_stages}", file=out, end="")
+        print(f";opt={self.opt}", file=out, end="")
         return out.getvalue().rstrip()
 
     @staticmethod
@@ -60,12 +68,16 @@ class EngineConfigOverride:  # pylint: disable=too-many-instance-attributes
         parser.add_argument("--max_history_size", type=int, default=None)
         parser.add_argument("--gpu_memory_utilization", type=float, default=None)
         parser.add_argument("--spec_draft_length", type=int, default=None)
+        parser.add_argument("--spec_tree_width", type=int, default=None)
+        parser.add_argument("--prefix_cache_mode", type=str, default="radix")
         parser.add_argument("--prefix_cache_max_num_recycling_seqs", type=int, default=None)
+        parser.add_argument("--prefill_mode", type=str, default="hybrid")
         parser.add_argument("--context_window_size", type=int, default=None)
         parser.add_argument("--sliding_window_size", type=int, default=None)
         parser.add_argument("--attention_sink_size", type=int, default=None)
         parser.add_argument("--tensor_parallel_shards", type=int, default=None)
         parser.add_argument("--pipeline_parallel_stages", type=int, default=None)
+        parser.add_argument("--opt", type=str, default=None)
         results = parser.parse_args([f"--{i}" for i in source.split(";") if i])
         return EngineConfigOverride(
             max_num_sequence=results.max_num_sequence,
@@ -74,12 +86,16 @@ class EngineConfigOverride:  # pylint: disable=too-many-instance-attributes
             max_history_size=results.max_history_size,
             gpu_memory_utilization=results.gpu_memory_utilization,
             spec_draft_length=results.spec_draft_length,
+            spec_tree_width=results.spec_tree_width,
+            prefix_cache_mode=results.prefix_cache_mode,
             prefix_cache_max_num_recycling_seqs=results.prefix_cache_max_num_recycling_seqs,
+            prefill_mode=results.prefill_mode,
             context_window_size=results.context_window_size,
             sliding_window_size=results.sliding_window_size,
             attention_sink_size=results.attention_sink_size,
             tensor_parallel_shards=results.tensor_parallel_shards,
             pipeline_parallel_stages=results.pipeline_parallel_stages,
+            opt=results.opt,
         )
 
 
@@ -198,6 +214,7 @@ def main(argv):
         additional_models=additional_models,
         tensor_parallel_shards=parsed.overrides.tensor_parallel_shards,
         pipeline_parallel_stages=parsed.overrides.pipeline_parallel_stages,
+        opt=parsed.overrides.opt,
         speculative_mode=parsed.speculative_mode,
         prefix_cache_mode=parsed.prefix_cache_mode,
         max_num_sequence=parsed.overrides.max_num_sequence,
@@ -209,6 +226,7 @@ def main(argv):
         max_history_size=parsed.overrides.max_history_size,
         gpu_memory_utilization=parsed.overrides.gpu_memory_utilization,
         spec_draft_length=parsed.overrides.spec_draft_length,
+        spec_tree_width=parsed.overrides.spec_tree_width,
         prefix_cache_max_num_recycling_seqs=parsed.overrides.prefix_cache_max_num_recycling_seqs,
         prefill_mode=parsed.prefill_mode,
         enable_tracing=parsed.enable_tracing,

@@ -46,9 +46,22 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
 
     tensor_parallel_shards : Optional[int]
         Number of shards to split the model into in tensor parallelism multi-gpu inference.
+        When "model_lib" is given, this field will be ignored, and the tensor_parallel_shards
+        in the model_lib metadata will be used.
 
     pipeline_parallel_stages : Optional[int]
         Number of pipeline stages to split the model layers for pipeline parallelism.
+        When "model_lib" is given, this field will be ignored, and the pipeline_parallel_stages
+        in the model_lib metadata will be used.
+
+    opt : Optional[str]
+        The optimization flags for JIT compilation.
+        When "model_lib" is given, this field will be ignored.
+        MLC LLM maintains a predefined set of optimization flags,
+        denoted as O0, O1, O2, O3, where O0 means no optimization, O2 means majority of them,
+        and O3 represents extreme optimization that could potentially break the system.
+        Meanwhile, optimization flags could be explicitly specified via details knobs, e.g.
+        "cublas_gemm=1;cudagraph=0".
 
     gpu_memory_utilization : Optional[float]
         A number in (0, 1) denoting the fraction of GPU memory used by the server in total.
@@ -96,6 +109,11 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
 
     spec_draft_length : int
         The number of tokens to generate in speculative proposal (draft).
+        Being 0 means to enable adaptive speculative mode, where the draft length
+        will be automatically adjusted based on engine state.
+
+    spec_tree_width : int
+        The width of the speculative decoding tree.
 
     prefix_cache_mode : Literal["disable", "radix"]
         The prefix cache mode.
@@ -122,6 +140,7 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     mode: Optional[Literal["local", "interactive", "server"]] = None
     tensor_parallel_shards: Optional[int] = None
     pipeline_parallel_stages: Optional[int] = None
+    opt: Optional[str] = None
     gpu_memory_utilization: Optional[float] = None
     kv_cache_page_size: int = 16
     max_num_sequence: Optional[int] = None
@@ -133,7 +152,8 @@ class EngineConfig:  # pylint: disable=too-many-instance-attributes
     max_history_size: Optional[int] = None
     kv_state_kind: Optional[Literal["kv_cache", "rnn_state"]] = None
     speculative_mode: Literal["disable", "small_draft", "eagle", "medusa"] = "disable"
-    spec_draft_length: int = 4
+    spec_draft_length: int = 0
+    spec_tree_width: int = 1
     prefix_cache_mode: Literal["disable", "radix"] = "radix"
     prefix_cache_max_num_recycling_seqs: Optional[int] = None
     prefill_mode: Literal["chunked", "hybrid"] = "hybrid"

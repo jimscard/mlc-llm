@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/sampler/gpu_sampler.cc
  * \brief The implementation for GPU sampler functions.
  */
@@ -7,6 +7,7 @@
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/nvtx.h>
 #include <tvm/runtime/packed_func.h>
+#include <tvm/runtime/registry.h>
 
 #include "../../support/random.h"
 #include "sampler.h"
@@ -133,7 +134,6 @@ class GPUSampler : public SamplerObj {
     int num_probs = probs_on_device->shape[0];
     int vocab_size = probs_on_device->shape[1];
     ICHECK_LE(num_probs, max_num_sample_);
-    ICHECK_EQ(request_ids.size(), num_samples);
     ICHECK_EQ(generation_cfg.size(), num_samples);
 
     // - Check if there is need for applying top p.
@@ -198,7 +198,8 @@ class GPUSampler : public SamplerObj {
                                  generation_cfg, rngs, /*top_p_applied=*/true);
   }
 
-  std::vector<std::vector<SampleResult>> BatchVerifyDraftTokensWithProbAfterTopP(
+  std::pair<std::vector<std::vector<SampleResult>>, std::vector<int>>
+  BatchVerifyDraftTokensWithProbAfterTopP(
       NDArray probs_on_device, const Array<String>& request_ids,
       const std::vector<int>& cum_verify_lengths, const Array<GenerationConfig>& generation_cfg,
       const std::vector<RandomGenerator*>& rngs,
@@ -329,10 +330,13 @@ class GPUSampler : public SamplerObj {
           CollectSampleResult(host_arrays, num_sequence, need_prob_values, top_prob_offset_indptr);
     }
 
+    std::vector<int> last_accepted_tree_node;
+    last_accepted_tree_node.reserve(num_sequence);
     for (int i = 0; i < num_sequence; i++) {
       int start = cum_verify_lengths[i];
       int end = cum_verify_lengths[i + 1];
       int last_accepted = static_cast<int*>(token_tree_parent_ptr_host->data)[i];
+      last_accepted_tree_node.push_back(last_accepted - start);
       int num_accepted = 0;
       for (int cur_node = last_accepted; cur_node != start;
            cur_node = token_tree_child_to_parent[cur_node]) {
@@ -349,7 +353,7 @@ class GPUSampler : public SamplerObj {
     }
 
     RECORD_EVENT(trace_recorder_, request_ids, "finish draft verification");
-    return sample_results;
+    return {sample_results, last_accepted_tree_node};
   }
 
  private:

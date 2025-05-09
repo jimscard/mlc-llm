@@ -1,6 +1,5 @@
 """
 Implementation for Phi architecture.
-TODO: add docstring
 """
 
 import dataclasses
@@ -67,17 +66,17 @@ class Phi1Config(ConfigBase):  # pylint: disable=too-many-instance-attributes
             logger.info(
                 "%s defaults to %d",
                 bold("prefill_chunk_size"),
-                min(self.context_window_size, 2048),
+                min(self.context_window_size, 8192),
             )
-            self.prefill_chunk_size = min(self.context_window_size, 2048)
+            self.prefill_chunk_size = min(self.context_window_size, 8192)
         elif self.prefill_chunk_size > self.context_window_size:
             logger.info(
                 "Overriding %s from %d to %d",
                 bold("prefill_chunk_size"),
                 self.prefill_chunk_size,
-                min(self.context_window_size, 2048),
+                min(self.context_window_size, 8192),
             )
-            self.prefill_chunk_size = min(self.context_window_size, 2048)
+            self.prefill_chunk_size = min(self.context_window_size, 8192)
         if self.num_key_value_heads == 0 or self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.intermediate_size == 0 or self.intermediate_size is None:
@@ -136,8 +135,7 @@ class PhiConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
                 )
         if self.prefill_chunk_size == 0:
             self.prefill_chunk_size = self.context_window_size
-        if self.prefill_chunk_size > self.context_window_size:
-            self.prefill_chunk_size = self.context_window_size
+        self.prefill_chunk_size = min(self.prefill_chunk_size, self.context_window_size)
         if self.n_head_kv == 0 or self.n_head_kv is None:
             self.n_head_kv = self.n_head
         if self.n_inner == 0 or self.n_inner is None:
@@ -218,7 +216,9 @@ class PhiMHA(nn.Module):  # pylint: disable=too-many-instance-attributes
         qkv = op.reshape(qkv, (b, s, h_q + h_kv + h_kv, d))
         # Attention
         output = op.reshape(
-            paged_kv_cache.attention_with_fused_qkv(layer_id, qkv, self.num_q_heads),
+            paged_kv_cache.attention_with_fused_qkv(
+                layer_id, qkv, self.num_q_heads, sm_scale=self.head_dim**-0.5
+            ),
             (b, s, h_q * d),
         )
         return self.out_proj(output)
@@ -408,6 +408,7 @@ class PhiForCausalLM(nn.Module):
         support_sliding_window: tir.Var,
     ) -> PagedKVCache:
         return PagedKVCache.create_generic(
+            attn_kind="mha",
             max_batch_size=max_batch_size,
             max_total_seq_len=max_total_seq_len,
             prefill_chunk_size=prefill_chunk_size,
@@ -416,7 +417,8 @@ class PhiForCausalLM(nn.Module):
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
             num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
-            head_dim=self.head_dim,
+            qk_head_dim=self.head_dim,
+            v_head_dim=self.head_dim,
             rope_mode=RopeMode.NORMAL,
             rope_scale=1,
             rope_theta=self.rope_theta,

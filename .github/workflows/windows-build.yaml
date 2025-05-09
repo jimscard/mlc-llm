@@ -19,10 +19,13 @@ jobs:
         shell: 'cmd /C call {0}'
 
     steps:
+    - name: Git config
+      run: >-
+        git config --system core.longpaths true
     - uses: actions/checkout@v3
       with:
         submodules: 'recursive'
-    - uses: conda-incubator/setup-miniconda@v2
+    - uses: conda-incubator/setup-miniconda@v3
       with:
         activate-environment: mlc-llm-build
         channel-priority: strict

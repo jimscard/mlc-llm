@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/action_commons.cc
  */
 
@@ -10,6 +10,126 @@
 namespace mlc {
 namespace llm {
 namespace serve {
+
+Array<EngineAction> CreateEngineActions(
+    Array<Model> models, EngineConfig engine_config, std::vector<picojson::object> model_configs,
+    std::vector<ModelWorkspace> model_workspaces, LogitProcessor logit_processor, Sampler sampler,
+    DraftTokenWorkspaceManager draft_token_workspace_manager, Tokenizer tokenizer,
+    Optional<EventTraceRecorder> trace_recorder, FRequestStreamCallback request_stream_callback,
+    Device device) {
+  Array<EngineAction> actions;
+  ModelMetadata model_metadata = models[0]->GetMetadata();
+  if (engine_config->speculative_mode != SpeculativeMode::kDisable) {
+    // Speculative decoding is only possible for more than one model.
+    ICHECK_GT(models.size(), 1U);
+    if (engine_config->speculative_mode == SpeculativeMode::kEagle) {
+      CHECK_GT(engine_config->spec_draft_length, 0)
+          << "The automatic spec decoding does not support Eagle mode as of now.";
+      actions = {EngineAction::EagleNewRequestPrefill(models,                         //
+                                                      logit_processor,                //
+                                                      sampler,                        //
+                                                      model_workspaces,               //
+                                                      draft_token_workspace_manager,  //
+                                                      engine_config,                  //
+                                                      model_configs,                  //
+                                                      trace_recorder),
+                 EngineAction::EagleBatchDraft(models, logit_processor, sampler, model_workspaces,
+                                               draft_token_workspace_manager, engine_config,
+                                               trace_recorder),
+                 EngineAction::EagleBatchVerify(models, logit_processor, sampler, model_workspaces,
+                                                draft_token_workspace_manager, engine_config,
+                                                trace_recorder)};
+    } else if (engine_config->speculative_mode == SpeculativeMode::kMedusa) {
+      CHECK_GT(engine_config->spec_draft_length, 0)
+          << "The automatic spec decoding does not support Eagle mode as of now.";
+      actions = {EngineAction::EagleNewRequestPrefill(models,                         //
+                                                      logit_processor,                //
+                                                      sampler,                        //
+                                                      model_workspaces,               //
+                                                      draft_token_workspace_manager,  //
+                                                      engine_config,                  //
+                                                      model_configs,                  //
+                                                      trace_recorder),
+                 EngineAction::EagleBatchVerify(models, logit_processor, sampler, model_workspaces,
+                                                draft_token_workspace_manager, engine_config,
+                                                trace_recorder)};
+    } else if (engine_config->spec_draft_length > 0) {
+      // The "small draft" mode speculative decoding.
+      // If "engine_config->spec_draft_length" > 0, it means the draft length is
+      // configured to be a fixed value.
+      actions = {
+          EngineAction::NewRequestPrefill(models,            //
+                                          logit_processor,   //
+                                          sampler,           //
+                                          model_workspaces,  //
+                                          engine_config,     //
+                                          model_configs,     //
+                                          trace_recorder),
+          EngineAction::BatchDraft(models, logit_processor, sampler, model_workspaces,
+                                   draft_token_workspace_manager, engine_config, trace_recorder),
+          EngineAction::BatchVerify(models, logit_processor, sampler, model_workspaces,
+                                    draft_token_workspace_manager, engine_config, trace_recorder)};
+    } else {
+      // The "small draft" mode speculative decoding.
+      // "engine_config->spec_draft_length" being 0 means we want to enable
+      // automatic speculative decoding, which decides the spec decoding draft length
+      // automatically.
+      actions = {EngineAction::NewRequestPrefill(models,            //
+                                                 logit_processor,   //
+                                                 sampler,           //
+                                                 model_workspaces,  //
+                                                 engine_config,     //
+                                                 model_configs,     //
+                                                 trace_recorder),
+                 EngineAction::AutoSpecDecode(
+                     /*spec_decode_actions=*/{EngineAction::BatchDraft(
+                                                  models, logit_processor, sampler,
+                                                  model_workspaces, draft_token_workspace_manager,
+                                                  engine_config, trace_recorder),
+                                              EngineAction::BatchVerify(
+                                                  models, logit_processor, sampler,
+                                                  model_workspaces, draft_token_workspace_manager,
+                                                  engine_config, trace_recorder)},
+                     /*batch_decode_actions=*/
+                     {EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler,
+                                                engine_config, trace_recorder)},
+                     engine_config)};
+    }
+  } else if (model_metadata.disaggregation) {
+    actions = {EngineAction::NewRequestPrefill(models,            //
+                                               logit_processor,   //
+                                               sampler,           //
+                                               model_workspaces,  //
+                                               engine_config,     //
+                                               model_configs,     //
+                                               trace_recorder),
+               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler, engine_config,
+                                         trace_recorder)};
+  } else {
+    // The normal mode.
+    actions = {EngineAction::NewRequestPrefill(models,            //
+                                               logit_processor,   //
+                                               sampler,           //
+                                               model_workspaces,  //
+                                               engine_config,     //
+                                               model_configs,     //
+                                               trace_recorder),
+               EngineAction::BatchJumpForward(models, tokenizer, trace_recorder),
+               EngineAction::BatchDecode(models, tokenizer, logit_processor, sampler, engine_config,
+                                         trace_recorder)};
+  }
+
+  if (model_metadata.disaggregation) {
+    // Insert the disaggregation actions.
+    Array<EngineAction> disaggregation_actions = {
+        EngineAction::DisaggPrepareReceive(models, engine_config, model_configs, trace_recorder,
+                                           request_stream_callback),
+        EngineAction::DisaggRemoteSend(models, model_workspaces, engine_config, model_configs,
+                                       trace_recorder, request_stream_callback, device)};
+    actions.insert(actions.begin(), disaggregation_actions.begin(), disaggregation_actions.end());
+  }
+  return actions;
+}
 
 void RemoveRequestFromModel(EngineState estate, int64_t req_internal_id,
                             const Array<Model>& models) {
@@ -26,7 +146,15 @@ void RemoveRequestFromModel(EngineState estate, int64_t req_internal_id,
  * \param rsentry The request state entry to remove.
  */
 void RemoveRequestStateEntry(EngineState estate, const Array<Model>& models,
-                             RequestStateEntry rsentry) {
+                             RequestStateEntry rsentry,
+                             Optional<DraftTokenWorkspaceManager> draft_token_workspace_manager) {
+  if (draft_token_workspace_manager.defined()) {
+    std::vector<int> draft_token_slots;
+    for (const RequestModelState& mstate : rsentry->mstates) {
+      mstate->RemoveAllDraftTokens(&draft_token_slots);
+      draft_token_workspace_manager.value()->FreeSlots(draft_token_slots);
+    }
+  }
   if (estate->prefix_cache->HasSequence(rsentry->mstates[0]->internal_id)) {
     // If the sequence is stored in prefix cache, call prefix cache to remove.
     if (!(rsentry->request->generation_cfg->debug_config.pinned_system_prompt)) {
@@ -41,10 +169,11 @@ void RemoveRequestStateEntry(EngineState estate, const Array<Model>& models,
   }
 }
 
-void ProcessFinishedRequestStateEntries(const std::vector<RequestStateEntry>& finished_rsentries,
-                                        EngineState estate, const Array<Model>& models,
-                                        int max_single_sequence_length,
-                                        Array<RequestStreamOutput>* callback_delta_outputs) {
+void ProcessFinishedRequestStateEntries(
+    const std::vector<RequestStateEntry>& finished_rsentries, EngineState estate,
+    const Array<Model>& models, int max_single_sequence_length,
+    Optional<DraftTokenWorkspaceManager> draft_token_workspace_manager,
+    Array<RequestStreamOutput>* callback_delta_outputs) {
   NVTXScopedRange nvtx_scope("Process finished requests");
   // - Remove the finished request state entries.
   for (const RequestStateEntry& rsentry : finished_rsentries) {
@@ -53,7 +182,7 @@ void ProcessFinishedRequestStateEntries(const std::vector<RequestStateEntry>& fi
     // Mark the status of this entry as finished.
     rsentry->status = RequestStateStatus::kFinished;
     // Remove the request state entry from all the models.
-    RemoveRequestStateEntry(estate, models, rsentry);
+    RemoveRequestStateEntry(estate, models, rsentry, draft_token_workspace_manager);
 
     RequestState rstate = estate->GetRequestState(rsentry->request);
     int parent_idx = rsentry->parent_idx;
@@ -74,7 +203,8 @@ void ProcessFinishedRequestStateEntries(const std::vector<RequestStateEntry>& fi
       rstate->entries[parent_idx]->status = RequestStateStatus::kFinished;
       // Remove the request state entry from all the models.
 
-      RemoveRequestStateEntry(estate, models, rstate->entries[parent_idx]);
+      RemoveRequestStateEntry(estate, models, rstate->entries[parent_idx],
+                              draft_token_workspace_manager);
       // Climb up to the parent.
       parent_idx = rstate->entries[parent_idx]->parent_idx;
     }
@@ -106,6 +236,7 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
                            const Tokenizer& tokenizer,
                            FRequestStreamCallback request_stream_callback,
                            int64_t max_single_sequence_length,
+                           Optional<DraftTokenWorkspaceManager> draft_token_workspace_manager,
                            Optional<EventTraceRecorder> trace_recorder) {
   NVTXScopedRange nvtx_scope("EngineAction postproc");
   int num_requests = requests.size();
@@ -169,10 +300,22 @@ void ActionStepPostProcess(Array<Request> requests, EngineState estate, const Ar
         estate->prefix_cache->ExtendSequence(rsentry->mstates[0]->internal_id, token_ids);
       }
     }
+
+    // - For all disaggregation requests with "remote_send",
+    // if it does not appear in the waiting queue, it means the prefill has been finished.
+    // In this case, we mark the request as finished.
+    if (request->generation_cfg->debug_config.disagg_config.kind ==
+        DisaggRequestKind::kRemoteSend) {
+      auto it = std::find(estate->waiting_queue.begin(), estate->waiting_queue.end(), request);
+      if (it == estate->waiting_queue.end()) {
+        CHECK_EQ(rstate->entries.size(), 1);
+        estate->postproc_workspace.finished_rsentries.push_back(rstate->entries[0]);
+      }
+    }
   }
 
   ProcessFinishedRequestStateEntries(estate->postproc_workspace.finished_rsentries, estate, models,
-                                     max_single_sequence_length,
+                                     max_single_sequence_length, draft_token_workspace_manager,
                                      &estate->postproc_workspace.callback_delta_outputs);
 
   if (!estate->postproc_workspace.callback_delta_outputs.empty()) {
@@ -200,6 +343,10 @@ RequestStateEntry PreemptLastRunningRequestStateEntry(
   }
   ICHECK_NE(preempt_rstate_idx, -1);
   RequestStateEntry rsentry = rstate->entries[preempt_rstate_idx];
+  if (estate->disaggregation) {
+    AbortRequestImpl(estate, models, request->id, "preempt");
+    return rsentry;
+  }
   // When the request state entry still has pending inputs,
   // it means the request is still in the waiting queue.
   bool partially_alive = !rsentry->mstates[0]->inputs.empty();
@@ -215,6 +362,15 @@ RequestStateEntry PreemptLastRunningRequestStateEntry(
       mstate->RemoveAllDraftTokens(&draft_token_slots);
       draft_token_workspace_manager.value()->FreeSlots(draft_token_slots);
     }
+
+    // If the commited tokens of the current model lags behind the
+    // committed tokens of the main model (models[0]), we commit those
+    // new tokens to this model.
+    for (size_t i = mstate->committed_tokens.size();
+         i < rsentry->mstates[0]->committed_tokens.size(); ++i) {
+      mstate->CommitToken(rsentry->mstates[0]->committed_tokens[i]);
+    }
+
     std::vector<int32_t> committed_token_ids;
     committed_token_ids.reserve(mstate->committed_tokens.size());
     for (const SampleResult& committed_token : mstate->committed_tokens) {
@@ -240,6 +396,7 @@ RequestStateEntry PreemptLastRunningRequestStateEntry(
     mstate->inputs = std::move(inputs);
     mstate->prefilled_inputs.clear();
     mstate->cached_committed_tokens = 0;
+    mstate->num_tokens_for_next_decode = 0;
   }
   if (estate->prefix_cache->HasSequence(rsentry->mstates[0]->internal_id)) {
     estate->prefix_cache->RecycleSequence(rsentry->mstates[0]->internal_id, /*lazy=*/false);

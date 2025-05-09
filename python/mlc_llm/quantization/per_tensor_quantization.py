@@ -4,12 +4,14 @@ import functools
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union
 
-from tvm import DataType, DataTypeCode, IRModule, nd, te, tir, topi
+import numpy as np
+from tvm import DataType, DataTypeCode, IRModule, nd, relax, te, tir, topi
 from tvm.relax.frontend import nn
 from tvm.runtime import NDArray
 
 from mlc_llm.loader import QuantizeMapping
 from mlc_llm.nn import MixtralExperts
+from mlc_llm.op import cutlass, extern
 from mlc_llm.support import logging
 
 from .utils import (
@@ -30,9 +32,9 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
 
     name: str
     kind: str
-    activation_dtype: Literal["e4m3_float8", "e5m2_float8"]
-    weight_dtype: Literal["e4m3_float8", "e5m2_float8"]
-    storage_dtype: Literal["uint32", "e4m3_float8", "e5m2_float8"]
+    activation_dtype: Literal["float8_e4m3fn", "float8_e5m2"]
+    weight_dtype: Literal["float8_e4m3fn", "float8_e5m2"]
+    storage_dtype: Literal["uint32", "float8_e4m3fn", "float8_e5m2"]
     model_dtype: Literal["float16"]
     quantize_embedding: bool = True
     quantize_final_fc: bool = True
@@ -182,8 +184,8 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
 
         def _create_quantize_func() -> IRModule:
             if DataType(self.weight_dtype).type_code in [
-                DataTypeCode.E4M3Float,
-                DataTypeCode.E5M2Float,
+                DataTypeCode.Float8E4M3FN,
+                DataTypeCode.Float8E5M2,
             ]:
                 quantize_func = functools.partial(
                     self.quantize_float8,
@@ -286,8 +288,8 @@ class PerTensorQuantize:  # pylint: disable=too-many-instance-attributes
         if self.use_scale:
             assert scale is not None
         if DataType(self.weight_dtype).type_code in [
-            DataTypeCode.E4M3Float,
-            DataTypeCode.E5M2Float,
+            DataTypeCode.Float8E4M3FN,
+            DataTypeCode.Float8E5M2,
         ]:
             return self.dequantize_float8(q_weight, scale, self.weight_dtype, out_shape)
         raise NotImplementedError()
@@ -435,6 +437,21 @@ class PerTensorQuantizeLinear(nn.Module):  # pylint: disable=too-many-instance-a
             self.config.weight_dtype == self.config.storage_dtype
             and self.config.calibration_mode == "inference"
         ):
+            if (
+                extern.get_store().cutlass_gemm
+                and functools.reduce(lambda x, y: x * y, x_q.shape[:-1]) != 1
+            ):
+                # Dispatch to cutlass kernel for gemm when cutlass is available.
+                scale = (
+                    x_scale * self.q_scale
+                    if self.config.use_scale
+                    else nn.wrap_nested(
+                        relax.Constant(nd.array(np.array([1.0]).astype("float32"))), "scale"
+                    )
+                )
+                return cutlass.fp8_gemm(
+                    x_q, self.q_weight, scale, self.config.weight_dtype, self.config.model_dtype
+                )
             x = nn.op.matmul(x_q, nn.permute_dims(self.q_weight), out_dtype="float32")
             if self.config.use_scale:
                 scale = x_scale * self.q_scale
@@ -638,8 +655,8 @@ class PerTensorQuantizeMixtralExperts(nn.Module):  # pylint: disable=too-many-in
             The per-tensor quantized MixtralExperts layer
         """
         if DataType(config.weight_dtype).type_code in [
-            DataTypeCode.E4M3Float,
-            DataTypeCode.E5M2Float,
+            DataTypeCode.Float8E4M3FN,
+            DataTypeCode.Float8E5M2,
         ]:
             return PerTensorQuantizeMixtralExperts._IMPL["fp8"].from_mixtral_experts(
                 src, config, name

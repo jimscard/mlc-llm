@@ -6,7 +6,7 @@ from tvm.script import ir as I
 from tvm.script import relax as R
 from tvm.script import tir as T
 
-from mlc_llm.nn.kv_cache import FlashInferPagedKVCache, PagedKVCache, RopeMode
+from mlc_llm.nn.kv_cache import PagedKVCache, RopeMode
 
 # mypy: disable-error-code="attr-defined"
 # pylint: disable=invalid-name,unused-argument,too-many-locals,too-many-statements
@@ -64,7 +64,7 @@ def test_nn_module_paged_kv_cache():
             cache: PagedKVCache,
             qkv: core.Tensor,
         ) -> core.Tensor:
-            return cache.attention_with_fused_qkv(0, qkv, num_qo_heads=32)
+            return cache.attention_with_fused_qkv(0, qkv, num_qo_heads=32, sm_scale=128**-0.5)
 
         def create_paged_kv_cache(
             self,
@@ -75,6 +75,7 @@ def test_nn_module_paged_kv_cache():
             support_sliding_window: tir.Var,
         ) -> PagedKVCache:
             return PagedKVCache.create_generic(
+                attn_kind="mha",
                 max_batch_size=max_batch_size,
                 max_total_seq_len=max_total_seq_len,
                 prefill_chunk_size=prefill_chunk_size,
@@ -83,7 +84,8 @@ def test_nn_module_paged_kv_cache():
                 num_hidden_layers=32,
                 num_attention_heads=32,
                 num_key_value_heads=32,
-                head_dim=128,
+                qk_head_dim=128,
+                v_head_dim=128,
                 rope_mode=RopeMode.NORMAL,
                 rope_scale=1,
                 rope_theta=10000,

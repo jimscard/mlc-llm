@@ -33,8 +33,6 @@ def openai_api_get_generation_config(request: RequestProtocol) -> Dict[str, Any]
         "max_tokens",
         "frequency_penalty",
         "presence_penalty",
-        "logprobs",
-        "top_logprobs",
         "logit_bias",
         "seed",
         "response_format",
@@ -48,6 +46,13 @@ def openai_api_get_generation_config(request: RequestProtocol) -> Dict[str, Any]
         kwargs["max_tokens"] = -1
     if request.stop is not None:
         kwargs["stop_strs"] = [request.stop] if isinstance(request.stop, str) else request.stop
+    if isinstance(request, openai_api_protocol.ChatCompletionRequest):
+        kwargs["logprobs"] = request.logprobs
+        kwargs["top_logprobs"] = request.top_logprobs
+    else:
+        logprobs = request.logprobs is not None
+        kwargs["logprobs"] = logprobs
+        kwargs["top_logprobs"] = request.logprobs if logprobs else 0
     return kwargs
 
 
@@ -155,7 +160,7 @@ def process_prompts(
 
 
 def convert_prompts_to_data(
-    prompts: Union[str, List[int], List[Union[str, List[int], data.Data]]]
+    prompts: Union[str, List[int], List[Union[str, List[int], data.Data]]],
 ) -> List[data.Data]:
     """Convert the given prompts in the combination of token id lists
     and/or data to all data."""

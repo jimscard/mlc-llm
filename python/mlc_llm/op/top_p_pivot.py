@@ -1,4 +1,4 @@
-"""Operators for choosing the pivot to cut-off top-p percentile """
+"""Operators for choosing the pivot to cut-off top-p percentile"""
 
 import tvm
 from tvm.script import tir as T
@@ -42,8 +42,7 @@ def top_p_pivot(pN, target: tvm.target.Target):
     eps_LR = 1e-7
 
     max_num_threads_per_block = get_max_num_threads_per_block(target)
-    if max_num_threads_per_block < TX:
-        TX = max_num_threads_per_block
+    TX = min(TX, max_num_threads_per_block)
 
     def _var(dtype="int32"):
         return T.alloc_buffer((1,), dtype, scope="local")
@@ -61,8 +60,8 @@ def top_p_pivot(pN, target: tvm.target.Target):
         var_final_lsum: T.handle,
     ):
         T.func_attr({"tir.is_scheduled": 1, "tir.noalias": True})
-        B = T.int32()
-        N = T.int32()
+        B = T.int32(is_size_var=True)
+        N = T.int32(is_size_var=True)
         prob = T.match_buffer(var_prob, (B, N,), "float32")
         top_p_arr = T.match_buffer(var_top_p_arr, (B,), dtype="float32")
         init_pivots = T.match_buffer(var_init_pivots, (B, pN), "float32")
@@ -294,8 +293,7 @@ def top_p_renorm(target: tvm.target.Target = None):
 
     if target:
         max_num_threads_per_block = get_max_num_threads_per_block(target)
-        if max_num_threads_per_block < TX:
-            TX = max_num_threads_per_block
+        TX = min(TX, max_num_threads_per_block)
 
     def _var(dtype="int32"):
         return T.alloc_buffer((1,), dtype, scope="local")
@@ -309,8 +307,8 @@ def top_p_renorm(target: tvm.target.Target = None):
         var_renorm_prob: T.handle,
     ):
         T.func_attr({"tir.is_scheduled": 1, "tir.noalias": True})
-        B = T.int32()
-        N = T.int32()
+        B = T.int32(is_size_var=True)
+        N = T.int32(is_size_var=True)
         prob = T.match_buffer(var_prob, (B, N,), "float32")
         final_pivot = T.match_buffer(var_final_pivot, (B,), "float32")
         final_lsum = T.match_buffer(var_final_lsum, (B,), "float32")

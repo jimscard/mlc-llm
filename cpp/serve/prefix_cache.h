@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/prefix_cache.h
  */
 #ifndef MLC_LLM_SERVE_PREFIX_CACHE_H_
@@ -123,7 +123,6 @@ class PrefixCacheObj : public Object {
   /*! \brief Return the prefix cache mode. */
   virtual PrefixCacheMode Mode() = 0;
 
-  static constexpr const uint32_t _type_index = TypeIndex::kDynamic;
   static constexpr const char* _type_key = "mlc.serve.PrefixCache";
   TVM_DECLARE_BASE_OBJECT_INFO(PrefixCacheObj, Object)
 };

@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/config.cc
  */
 #include "config.h"
@@ -13,6 +13,7 @@
 
 #include "../json_ffi/openai_api_protocol.h"
 #include "../support/json_parser.h"
+#include "../support/utils.h"
 #include "data.h"
 
 namespace mlc {
@@ -62,6 +63,105 @@ picojson::object ResponseFormat::AsJSON() const {
   return config;
 }
 
+/****************** DisaggConfig ******************/
+
+Result<DisaggConfig> DisaggConfig::FromJSON(const picojson::object& config) {
+  using TResult = Result<DisaggConfig>;
+  DisaggConfig res;
+  std::optional<std::string> kind = json::LookupOptional<std::string>(config, "kind");
+  if (kind.has_value()) {
+    if (kind.value() == "prepare_receive") {
+      res.kind = DisaggRequestKind::kPrepareReceive;
+    } else if (kind.value() == "remote_send") {
+      res.kind = DisaggRequestKind::kRemoteSend;
+    } else if (kind.value() == "start_generation") {
+      res.kind = DisaggRequestKind::kStartGeneration;
+    } else {
+      return TResult::Error("Unknown disaggregation request kind " + kind.value());
+    }
+  }
+  std::optional<std::string> kv_append_metadata_encoded =
+      json::LookupOptional<std::string>(config, "kv_append_metadata");
+  if (kv_append_metadata_encoded.has_value()) {
+    picojson::value parse_result;
+    std::string err =
+        picojson::parse(parse_result, Base64Decode(kv_append_metadata_encoded.value()));
+    if (!err.empty()) {
+      return TResult::Error("kv_append_metadata parse error: " + err);
+    }
+    if (!parse_result.is<picojson::array>()) {
+      return TResult::Error("kv_append_metadata is not array of integer.");
+    }
+    picojson::array kv_append_metadata_arr = parse_result.get<picojson::array>();
+    std::vector<IntTuple> kv_append_metadata;
+    int ptr = 0;
+    while (ptr < static_cast<int>(kv_append_metadata_arr.size())) {
+      if (!kv_append_metadata_arr[ptr].is<int64_t>()) {
+        return TResult::Error("Invalid kv append metadata value in kv_append_metadata array");
+      }
+      int num_segments = kv_append_metadata_arr[ptr].get<int64_t>();
+      if (ptr + num_segments * 2 + 1 > static_cast<int>(kv_append_metadata_arr.size())) {
+        return TResult::Error("Invalid kv append metadata compression in kv_append_metadata");
+      }
+      std::vector<int64_t> compressed_kv_append_metadata{num_segments};
+      compressed_kv_append_metadata.reserve(num_segments * 2 + 1);
+      for (int i = 1; i <= num_segments * 2; ++i) {
+        if (!kv_append_metadata_arr[ptr + i].is<int64_t>()) {
+          return TResult::Error("Invalid kv append metadata value in kv_append_metadata array");
+        }
+        compressed_kv_append_metadata.push_back(kv_append_metadata_arr[ptr + i].get<int64_t>());
+      }
+      kv_append_metadata.push_back(IntTuple(std::move(compressed_kv_append_metadata)));
+      ptr += num_segments * 2 + 1;
+    }
+    res.kv_append_metadata = std::move(kv_append_metadata);
+  }
+  res.kv_window_begin = json::LookupOptional<int64_t>(config, "kv_window_begin");
+  res.kv_window_end = json::LookupOptional<int64_t>(config, "kv_window_end");
+  res.dst_group_offset = json::LookupOptional<int64_t>(config, "dst_group_offset");
+  return TResult::Ok(res);
+}
+
+picojson::object DisaggConfig::AsJSON() const {
+  picojson::object config;
+  switch (kind) {
+    case DisaggRequestKind::kPrepareReceive: {
+      config["kind"] = picojson::value("prepare_receive");
+      break;
+    }
+    case DisaggRequestKind::kRemoteSend: {
+      config["kind"] = picojson::value("remote_send");
+      break;
+    }
+    case DisaggRequestKind::kStartGeneration: {
+      config["kind"] = picojson::value("start_generation");
+      break;
+    }
+    default:
+      break;
+  }
+  if (!kv_append_metadata.empty()) {
+    picojson::array kv_append_metadata_arr;
+    for (const IntTuple& compressed_kv_append_metadata : kv_append_metadata) {
+      for (int64_t value : compressed_kv_append_metadata) {
+        kv_append_metadata_arr.push_back(picojson::value(value));
+      }
+    }
+    config["kv_append_metadata"] =
+        picojson::value(Base64Encode(picojson::value(kv_append_metadata_arr).serialize()));
+  }
+  if (kv_window_begin.has_value()) {
+    config["kv_window_begin"] = picojson::value(static_cast<int64_t>(kv_window_begin.value()));
+  }
+  if (kv_window_end.has_value()) {
+    config["kv_window_end"] = picojson::value(static_cast<int64_t>(kv_window_end.value()));
+  }
+  if (dst_group_offset.has_value()) {
+    config["dst_group_offset"] = picojson::value(static_cast<int64_t>(dst_group_offset.value()));
+  }
+  return config;
+}
+
 /****************** DebugConfig ******************/
 
 Result<DebugConfig> DebugConfig::FromJSON(const picojson::object& config) {
@@ -74,7 +174,7 @@ Result<DebugConfig> DebugConfig::FromJSON(const picojson::object& config) {
     if (special_request == "query_engine_metrics") {
       res.special_request = SpecialRequestKind::kQueryEngineMetrics;
     } else {
-      return TResult::Error("Uknown special request " + special_request);
+      return TResult::Error("Unknown special request " + special_request);
     }
   }
   std::string grammar_execution_mode =
@@ -84,7 +184,14 @@ Result<DebugConfig> DebugConfig::FromJSON(const picojson::object& config) {
   } else if (grammar_execution_mode == "constraint") {
     res.grammar_execution_mode = GrammarExecutionMode::kConstraint;
   } else {
-    return TResult::Error("Uknown grammar execution mode " + grammar_execution_mode);
+    return TResult::Error("Unknown grammar execution mode " + grammar_execution_mode);
+  }
+  if (auto disagg_config_obj = json::LookupOptional<picojson::object>(config, "disagg_config")) {
+    Result<DisaggConfig> disagg_config = DisaggConfig::FromJSON(disagg_config_obj.value());
+    if (disagg_config.IsErr()) {
+      return TResult::Error(disagg_config.UnwrapErr());
+    }
+    res.disagg_config = disagg_config.Unwrap();
   }
   return TResult::Ok(res);
 }
@@ -114,6 +221,9 @@ picojson::object DebugConfig::AsJSON() const {
       break;
     }
   }
+  if (disagg_config.kind != DisaggRequestKind::kNone) {
+    config["disagg_config"] = picojson::value(disagg_config.AsJSON());
+  }
   return config;
 }
 
@@ -138,8 +248,8 @@ Result<GenerationConfig> GenerationConfig::Validate(GenerationConfig cfg) {
   if (cfg->repetition_penalty <= 0) {
     return TResult::Error("\"repetition_penalty\" must be positive");
   }
-  if (cfg->top_logprobs < 0 || cfg->top_logprobs > 5) {
-    return TResult::Error("At most 5 top logprob tokens are supported");
+  if (cfg->top_logprobs < 0 || cfg->top_logprobs > 20) {
+    return TResult::Error("At most 20 top logprob tokens are supported");
   }
   if (cfg->top_logprobs != 0 && !(cfg->logprobs)) {
     return TResult::Error("\"logprobs\" must be true to support \"top_logprobs\"");
@@ -342,6 +452,7 @@ EngineConfig EngineConfig::FromJSONAndInferredConfig(
       json, "speculative_mode", SpeculativeModeToString(n->speculative_mode)));
   n->spec_draft_length =
       json::LookupOrDefault<int64_t>(json, "spec_draft_length", n->spec_draft_length);
+  n->spec_tree_width = json::LookupOrDefault<int64_t>(json, "spec_tree_width", n->spec_tree_width);
   n->prefill_mode = PrefillModeFromString(json::LookupOrDefault<std::string>(
       json, "prefill_mode", PrefillModeToString(n->prefill_mode)));
   n->verbose = json::LookupOrDefault<bool>(json, "verbose", n->verbose);
@@ -357,9 +468,8 @@ EngineConfig EngineConfig::FromJSONAndInferredConfig(
 
   n->prefix_cache_mode = PrefixCacheModeFromString(json::LookupOrDefault<std::string>(
       json, "prefix_cache_mode", PrefixCacheModeToString(n->prefix_cache_mode)));
-  n->prefix_cache_max_num_recycling_seqs =
-      json::LookupOrDefault<int64_t>(json, "prefix_cache_max_recycling_seqs", n->max_num_sequence);
-
+  n->prefix_cache_max_num_recycling_seqs = json::LookupOrDefault<int64_t>(
+      json, "prefix_cache_max_num_recycling_seqs", n->max_num_sequence);
   return EngineConfig(n);
 }
 
@@ -730,6 +840,7 @@ Result<InferrableEngineConfig> InferrableEngineConfig::InferForKVCache(
       }
       params_bytes += param_size;
     }
+    params_bytes /= metadata.pipeline_parallel_stages;
     for (const auto& [func_name, temp_buffer_size] : metadata.memory_usage) {
       temp_buffer_bytes = std::max(temp_buffer_bytes, temp_buffer_size);
     }

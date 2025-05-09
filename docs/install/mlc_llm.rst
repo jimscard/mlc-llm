@@ -30,14 +30,7 @@ Select your operating system/compute platform and run the command in your termin
                 .. code-block:: bash
 
                     conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly mlc-ai-nightly
-
-            .. tab:: CUDA 12.1
-
-                .. code-block:: bash
-
-                    conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cu121 mlc-ai-nightly-cu121
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
 
             .. tab:: CUDA 12.2
 
@@ -46,19 +39,26 @@ Select your operating system/compute platform and run the command in your termin
                     conda activate your-environment
                     python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cu122 mlc-ai-nightly-cu122
 
-            .. tab:: ROCm 5.6
+            .. tab:: CUDA 12.3
 
                 .. code-block:: bash
 
                     conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-rocm56 mlc-ai-nightly-rocm56
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cu123 mlc-ai-nightly-cu123
 
-            .. tab:: ROCm 5.7
+            .. tab:: ROCm 6.1
 
                 .. code-block:: bash
 
                     conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-rocm57 mlc-ai-nightly-rocm57
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-rocm61 mlc-ai-nightly-rocm61
+
+            .. tab:: ROCm 6.2
+
+                .. code-block:: bash
+
+                    conda activate your-environment
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-rocm62 mlc-ai-nightly-rocm62
 
             .. tab:: Vulkan
 
@@ -98,7 +98,7 @@ Select your operating system/compute platform and run the command in your termin
                 .. code-block:: bash
 
                     conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly mlc-ai-nightly
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
 
         .. note::
 
@@ -124,7 +124,7 @@ Select your operating system/compute platform and run the command in your termin
                 .. code-block:: bash
 
                     conda activate your-environment
-                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly mlc-ai-nightly
+                    python -m pip install --pre -U -f https://mlc.ai/wheels mlc-llm-nightly-cpu mlc-ai-nightly-cpu
 
         .. note::
             Please make sure your conda environment comes with python and pip.

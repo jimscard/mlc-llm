@@ -1,5 +1,5 @@
 /*!
- *  Copyright (c) 2023 by Contributors
+ *  Copyright (c) 2023-2025 by Contributors
  * \file serve/engine_actions/eagle_batch_draft.cc
  */
 
@@ -26,17 +26,14 @@ class EagleBatchDraftActionObj : public EngineActionObj {
                                     Sampler sampler, std::vector<ModelWorkspace> model_workspaces,
                                     DraftTokenWorkspaceManager draft_token_workspace_manager,
                                     EngineConfig engine_config,
-                                    Optional<EventTraceRecorder> trace_recorder, int draft_length)
+                                    Optional<EventTraceRecorder> trace_recorder)
       : models_(std::move(models)),
         logit_processor_(std::move(logit_processor)),
         sampler_(std::move(sampler)),
         model_workspaces_(std::move(model_workspaces)),
         draft_token_workspace_manager_(std::move(draft_token_workspace_manager)),
         engine_config_(std::move(engine_config)),
-        trace_recorder_(std::move(trace_recorder)),
-        draft_length_(draft_length) {
-    ICHECK_GT(draft_length_, 0);
-  }
+        trace_recorder_(std::move(trace_recorder)) {}
 
   Array<Request> Step(EngineState estate) final {
     // - Only run spec decode when there are two models (llm+ssm) and >=1 running requests.
@@ -70,9 +67,11 @@ class EagleBatchDraftActionObj : public EngineActionObj {
     std::vector<int64_t> request_internal_ids;
     Array<GenerationConfig> generation_cfg;
     std::vector<RandomGenerator*> rngs;
+    std::vector<std::vector<int>> draft_token_indices;
     request_ids.reserve(num_rsentries);
     request_internal_ids.reserve(num_rsentries);
     generation_cfg.reserve(num_rsentries);
+    draft_token_indices.reserve(num_rsentries);
     for (const RequestStateEntry& rsentry : running_rsentries) {
       request_ids.push_back(rsentry->request->id);
       request_internal_ids.push_back(rsentry->mstates[0]->internal_id);
@@ -80,6 +79,8 @@ class EagleBatchDraftActionObj : public EngineActionObj {
       rngs.push_back(&rsentry->rng);
     }
 
+    ICHECK_GT(estate->spec_draft_length, 0)
+        << "The speculative decoding draft length must be positive.";
     // The first model doesn't get involved in draft proposal.
     for (int model_id = 1; model_id < static_cast<int>(models_.size()); ++model_id) {
       // Collect
@@ -97,7 +98,7 @@ class EagleBatchDraftActionObj : public EngineActionObj {
       ObjectRef hidden_states = model_workspaces_[model_id].hidden_states;
       // Concat last hidden_states
       draft_token_slots_.clear();
-      if (draft_length_ > 1) {
+      if (estate->spec_draft_length > 1) {
         for (int i = 0; i < num_rsentries; ++i) {
           draft_token_slots_.push_back(mstates[i]->draft_token_slots.back());
         }
@@ -105,13 +106,16 @@ class EagleBatchDraftActionObj : public EngineActionObj {
             model_workspaces_[0].draft_hidden_states_storage, draft_token_slots_, &hidden_states);
       }
       // The first draft token has been generated in prefill/verify stage
-      for (int draft_id = 1; draft_id < draft_length_; ++draft_id) {
+      for (int draft_id = 1; draft_id < estate->spec_draft_length; ++draft_id) {
+        draft_token_indices.clear();
         auto tdraft_start = std::chrono::high_resolution_clock::now();
         // prepare new input tokens
         input_tokens.clear();
         for (int i = 0; i < num_rsentries; ++i) {
           ICHECK(!mstates[i]->draft_output_tokens.empty());
           input_tokens.push_back(mstates[i]->draft_output_tokens.back().GetTokenId());
+          draft_token_indices.emplace_back(
+              std::vector<int>{static_cast<int>(mstates[i]->draft_output_tokens.size() - 1)});
         }
 
         // - Compute embeddings.
@@ -138,7 +142,8 @@ class EagleBatchDraftActionObj : public EngineActionObj {
         ICHECK_EQ(logits->shape[0], num_rsentries);
 
         // - Update logits.
-        logit_processor_->InplaceUpdateLogits(logits, generation_cfg, mstates, request_ids);
+        logit_processor_->InplaceUpdateLogits(logits, generation_cfg, mstates, request_ids, nullptr,
+                                              &mstates, &draft_token_indices);
 
         // - Compute probability distributions.
         NDArray probs_on_device =
@@ -208,8 +213,6 @@ class EagleBatchDraftActionObj : public EngineActionObj {
   EngineConfig engine_config_;
   /*! \brief Event trace recorder. */
   Optional<EventTraceRecorder> trace_recorder_;
-  /*! \brief Draft proposal length */
-  int draft_length_;
   /*! \brief Temporary buffer to store the slots of the current draft tokens */
   std::vector<int> draft_token_slots_;
 };
@@ -219,12 +222,11 @@ EngineAction EngineAction::EagleBatchDraft(Array<Model> models, LogitProcessor l
                                            std::vector<ModelWorkspace> model_workspaces,
                                            DraftTokenWorkspaceManager draft_token_workspace_manager,
                                            EngineConfig engine_config,
-                                           Optional<EventTraceRecorder> trace_recorder,
-                                           int draft_length) {
+                                           Optional<EventTraceRecorder> trace_recorder) {
   return EngineAction(make_object<EagleBatchDraftActionObj>(
       std::move(models), std::move(logit_processor), std::move(sampler),
       std::move(model_workspaces), std::move(draft_token_workspace_manager),
-      std::move(engine_config), std::move(trace_recorder), draft_length));
+      std::move(engine_config), std::move(trace_recorder)));
 }
 
 }  // namespace serve

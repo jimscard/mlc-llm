@@ -16,7 +16,6 @@ from mlc_llm.support import logging
 from mlc_llm.support.argparse import ArgumentParser
 from mlc_llm.support.style import bold, green, red
 
-logging.enable_logging()
 logger = logging.getLogger(__name__)
 
 GEN_CONFIG_OPTIONAL_ARGS = [
@@ -283,7 +282,7 @@ def _main(  # pylint: disable=too-many-locals, too-many-arguments
     failed_cases: List[Tuple[str, str]] = []
     delivered_log = _get_current_log(log)
     for task_index, task in enumerate(delivery_diff.tasks, 1):
-        logger.info(
+        logger.info(  # pylint: disable=logging-not-lazy
             bold("[{task_index}/{total_tasks}] Processing model: ").format(
                 task_index=task_index,
                 total_tasks=len(delivery_diff.tasks),

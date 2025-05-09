@@ -14,7 +14,7 @@ The demo APK below is built for Samsung S23 with Snapdragon 8 Gen 2 chip.
 
 .. image:: https://seeklogo.com/images/D/download-android-apk-badge-logo-D074C6882B-seeklogo.com.png
   :width: 135
-  :target: https://github.com/mlc-ai/binary-mlc-llm-libs/releases/download/Android-08052024/mlc-chat.apk
+  :target: https://github.com/mlc-ai/binary-mlc-llm-libs/releases/download/Android-09262024/mlc-chat.apk
 
 Prerequisite
 ------------
@@ -136,7 +136,7 @@ We have a one-line command to build and prepare all the model libraries:
 .. code:: bash
 
    cd /path/to/MLCChat  # e.g., "android/MLCChat"
-   export MLC_LLM_SOURCE_DIR=/path/to/mlc-llm  # e.g., "../.."
+   export MLC_LLM_SOURCE_DIR=/path/to/mlc-llm  # has to be absolute path, ../.. does not work
    mlc_llm package
 
 This command mainly executes the following two steps:
